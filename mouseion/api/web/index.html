@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mouseion</title>
+    <link rel="stylesheet" href="/web/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Mouseion</h1>
+          <p id="stats">Loading...</p>
+        </div>
+        <button id="refresh" type="button">Refresh</button>
+      </header>
+
+      <section class="grid">
+        <form id="file-form" class="panel">
+          <h2>Files</h2>
+          <label class="dropzone">
+            <input id="file-input" type="file" />
+            <span id="file-label">Drop or choose PDF, Markdown, text, or HTML</span>
+          </label>
+          <input id="file-tags" placeholder="tags, comma separated" />
+          <button type="submit">Ingest file</button>
+        </form>
+
+        <form id="url-form" class="panel">
+          <h2>URL</h2>
+          <input id="url-input" inputmode="url" placeholder="https://arxiv.org/html/..." required />
+          <input id="url-tags" placeholder="tags, comma separated" />
+          <button type="submit">Ingest URL</button>
+        </form>
+
+        <form id="memory-form" class="panel">
+          <h2>Memory</h2>
+          <textarea id="memory-input" rows="7" placeholder="Write a note to remember" required></textarea>
+          <input id="memory-tags" placeholder="tags, comma separated" />
+          <button type="submit">Save memory</button>
+        </form>
+
+        <form id="search-form" class="panel search-panel">
+          <h2>Search</h2>
+          <input id="search-input" placeholder="Search the mouseion" required />
+          <label class="checkbox">
+            <input id="search-neighbours" type="checkbox" />
+            <span>Graph neighbours</span>
+          </label>
+          <button type="submit">Search</button>
+        </form>
+      </section>
+
+      <section class="panel output-panel">
+        <h2>Results</h2>
+        <div id="message"></div>
+        <div id="results"></div>
+      </section>
+    </main>
+    <script src="/web/app.js"></script>
+  </body>
+</html>
