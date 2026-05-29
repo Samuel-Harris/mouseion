@@ -40,7 +40,9 @@ def create_app() -> FastAPI:
     logger = get_logger(__name__)
     service_ref: dict[str, MouseionService] = {}
     tasks: BackgroundTasks | None = None
-    mcp_app = build_mcp(service_ref).streamable_http_app()
+    mcp_app = build_mcp(
+        service_ref, description=settings.mouseion_mcp_description
+    ).streamable_http_app()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:

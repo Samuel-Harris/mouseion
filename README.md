@@ -65,6 +65,7 @@ Settings are loaded from `.env` and environment variables:
 | `MOUSEION_PORT`                | `7778`                   |
 | `MOUSEION_DATA_DIR`            | `./data`                 |
 | `MOUSEION_REPOS_DIR`           | `./repos`                |
+| `MOUSEION_MCP_DESCRIPTION`     | unset                    |
 | `OLLAMA_HOST`                  | `http://127.0.0.1:11434` |
 | `EMBEDDING_MODEL`              | `nomic-embed-text`       |
 | `CHUNK_TARGET_TOKENS`          | `512`                    |
