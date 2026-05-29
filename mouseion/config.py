@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     mouseion_port: int = Field(default=7778, alias="MOUSEION_PORT")
     mouseion_data_dir: Path = Field(default=Path("./data"), alias="MOUSEION_DATA_DIR")
     mouseion_repos_dir: Path = Field(default=Path("./repos"), alias="MOUSEION_REPOS_DIR")
+    mouseion_mcp_description: str | None = Field(default=None, alias="MOUSEION_MCP_DESCRIPTION")
     ollama_host: str = Field(default="http://127.0.0.1:11434", alias="OLLAMA_HOST")
     embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
     chunk_target_tokens: int = Field(default=512, alias="CHUNK_TARGET_TOKENS")
@@ -42,6 +43,14 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("mouseion_mcp_description")
+    @classmethod
+    def normalize_mcp_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @model_validator(mode="after")
     def validate_ranges(self) -> Settings:

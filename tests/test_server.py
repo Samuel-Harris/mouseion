@@ -6,7 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
+from mouseion.api.mcp_tools import build_mcp
 from mouseion.api.server import create_app
+
+
+def test_build_mcp_uses_custom_description() -> None:
+    mcp = build_mcp({}, description="Custom corpus description")
+
+    assert mcp.instructions == "Custom corpus description"
 
 
 def test_mcp_route_is_exposed_without_double_prefix() -> None:
@@ -22,6 +29,7 @@ def test_mcp_endpoint_runs_inside_main_lifespan(
 ) -> None:
     monkeypatch.setenv("MOUSEION_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MOUSEION_REPOS_DIR", str(tmp_path / "repos"))
+    monkeypatch.setenv("MOUSEION_MCP_DESCRIPTION", "Test corpus description")
     monkeypatch.setenv("SIMILAR_EDGE_RECOMPUTE_HOURS", "0")
     app = create_app()
     payload = {
@@ -35,7 +43,7 @@ def test_mcp_endpoint_runs_inside_main_lifespan(
         },
     }
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:7778") as client:
         response = client.post(
             "/mcp",
             json=payload,
@@ -44,3 +52,4 @@ def test_mcp_endpoint_runs_inside_main_lifespan(
 
     assert response.status_code != 404
     assert response.status_code != 500
+    assert response.json()["result"]["instructions"] == "Test corpus description"

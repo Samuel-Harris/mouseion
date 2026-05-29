@@ -20,8 +20,15 @@ from mouseion.domain.models import (
 from mouseion.services.service import MouseionService
 
 
-def build_mcp(service_ref: dict[str, MouseionService]) -> FastMCP:
-    mcp = FastMCP("Mouseion", stateless_http=True, json_response=True)
+def build_mcp(
+    service_ref: dict[str, MouseionService], description: str | None = None
+) -> FastMCP:
+    mcp = FastMCP(
+        "Mouseion",
+        instructions=description,
+        stateless_http=True,
+        json_response=True,
+    )
 
     def service() -> MouseionService:
         return service_ref["service"]
