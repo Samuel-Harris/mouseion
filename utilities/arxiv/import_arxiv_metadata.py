@@ -40,13 +40,13 @@ from mouseion.services.factory import open_services
 from mouseion.services.graph import GraphService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
-from mouseion.support.utils import canonical_text_hash
 
 DEFAULT_INPUT = Path("raw_data/raw-kaggle-arxiv-metadata-2026-05-29.json")
 DEFAULT_CATEGORIES_JSON = Path("utilities/arxiv/categories.json")
 KAGGLE_ARXIV_DOWNLOAD_URL = (
     "https://www.kaggle.com/datasets/Cornell-University/arxiv?resource=download"
 )
+CATEGORIES_FIELD_RE = re.compile(rb'"categories"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 class MissingInputFileError(FileNotFoundError):
@@ -106,7 +106,6 @@ class PreparedPaper:
     source: str
     title: str
     content: str
-    content_hash: str
     tags: list[str]
     metadata: dict[str, Any]
     category_codes: list[str]
@@ -235,7 +234,6 @@ def prepare_record(
         source=f"arxiv:{arxiv_id}",
         title=title,
         content=content,
-        content_hash=canonical_text_hash(content),
         tags=tags,
         metadata=metadata,
         category_codes=category_codes,
@@ -256,6 +254,11 @@ async def import_arxiv_metadata(
     catalog = load_category_catalog(options.categories_json)
     requested_groups = {slugify(group) for group in options.groups}
     requested_categories = {category.lower() for category in options.categories}
+    requested_filter_categories = category_filter_codes(
+        catalog,
+        requested_groups=requested_groups,
+        requested_categories=requested_categories,
+    )
     import_timestamp = datetime.now(tz=UTC).isoformat(timespec="seconds")
     import_source = str(options.input)
 
@@ -316,6 +319,11 @@ async def import_arxiv_metadata(
                         break
                     line = line.strip()
                     if not line:
+                        stats.skipped += 1
+                        continue
+                    if requested_filter_categories and not raw_categories_match_filter(
+                        line, requested_filter_categories
+                    ):
                         stats.skipped += 1
                         continue
                     try:
@@ -495,6 +503,44 @@ def selected_by_filters(
     category_match = bool(record_categories & requested_categories)
     group_match = catalog.group_matches(requested_groups, paper.category_codes)
     return category_match or group_match
+
+
+def category_filter_codes(
+    catalog: CategoryCatalog,
+    *,
+    requested_groups: set[str],
+    requested_categories: set[str],
+) -> set[str]:
+    if not requested_groups and not requested_categories:
+        return set()
+    return requested_categories | {
+        code for code, entry in catalog.categories.items() if entry.group_slug in requested_groups
+    }
+
+
+def raw_categories_match_filter(line: bytes, requested_categories: set[str]) -> bool:
+    raw_categories = extract_raw_categories(line)
+    if raw_categories is None:
+        return False
+    return any(code.lower() in requested_categories for code in raw_categories.split())
+
+
+def extract_raw_categories(line: bytes) -> str | None:
+    match = CATEGORIES_FIELD_RE.search(line)
+    if match is None:
+        return None
+
+    raw_value = match.group(1)
+    if b"\\" not in raw_value:
+        return raw_value.decode("utf-8", errors="replace")
+
+    try:
+        loaded: object = json.loads(b'"' + raw_value + b'"')
+    except json.JSONDecodeError:
+        return None
+    if isinstance(loaded, str):
+        return loaded
+    return None
 
 
 def normalize_text(value: str) -> str:
