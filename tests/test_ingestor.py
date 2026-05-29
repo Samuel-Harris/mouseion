@@ -169,7 +169,7 @@ def _pdf_bytes(text: str) -> bytes:
     lines = [text[index : index + 80] for index in range(0, len(text), 80)]
     for index, line in enumerate(lines[:20]):
         page.insert_text((72, 72 + index * 24), line)
-    return document.tobytes()
+    return bytes(document.tobytes())
 
 
 def _response(

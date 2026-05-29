@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from struct import pack, unpack
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import anyio
@@ -74,12 +74,21 @@ class SQLiteStore:
         await anyio.to_thread.run_sync(self._open_sync)
         await self.bootstrap()
 
-    def _open_sync(self) -> None:
-        conn = apsw.Connection(str(self.settings.sqlite_path))
+    async def open_readonly(self) -> None:
+        await anyio.to_thread.run_sync(self._open_sync, True)
+
+    def _open_sync(self, readonly: bool = False) -> None:
+        flags = (
+            apsw.SQLITE_OPEN_READONLY
+            if readonly
+            else apsw.SQLITE_OPEN_READWRITE | apsw.SQLITE_OPEN_CREATE
+        )
+        conn = apsw.Connection(str(self.settings.sqlite_path), flags=flags)
         conn.enableloadextension(True)
         sqlite_vec.load(conn)
         conn.enableloadextension(False)
-        conn.execute("PRAGMA journal_mode=WAL")
+        if not readonly:
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA busy_timeout=5000")
@@ -316,57 +325,18 @@ class SQLiteStore:
         def run(conn: apsw.Connection) -> list[DocumentChunkUpsertResult]:
             now_timestamp = _to_db_timestamp(now)
             document_ids = [document.document_id or uuid4() for document in documents]
-            provided_ids = [str(document_id) for document_id in document_ids]
-            existing_ids: set[str] = set()
-            for id_batch in _batched(provided_ids, 900):
-                placeholders = ",".join("?" for _ in id_batch)
-                rows = conn.cursor().execute(
-                    f"SELECT id FROM documents WHERE id IN ({placeholders})",
-                    id_batch,
-                )
-                existing_ids.update(str(row[0]) for row in rows)
-
-            max_chunk_row = _fetch_one(conn, "SELECT COALESCE(max(id), 0) AS max_id FROM chunks")
-            next_chunk_id = int(max_chunk_row["max_id"] if max_chunk_row else 0)
-            document_rows: list[tuple[Any, ...]] = []
-            tag_rows: list[tuple[str, str]] = []
-            chunk_rows: list[tuple[int, str, str, int, int, str]] = []
-            vector_rows: list[tuple[int, bytes]] = []
-            existing_document_ids: list[str] = []
+            existing_ids = _existing_document_ids(conn, document_ids)
             results: list[DocumentChunkUpsertResult] = []
 
             for document_id, document in zip(document_ids, documents, strict=True):
                 document_id_text = str(document_id)
                 exists = document_id_text in existing_ids
                 if exists:
-                    existing_document_ids.append(document_id_text)
+                    _delete_document_children(conn, [document_id_text])
 
-                document_rows.append(
-                    (
-                        document_id_text,
-                        str(document.doc_type),
-                        document.title,
-                        document.source,
-                        document.content_hash,
-                        now_timestamp,
-                        now_timestamp,
-                        json_dumps(document.metadata),
-                    )
-                )
-                tag_rows.extend((document_id_text, tag) for tag in document.tags)
-                for chunk_index, (content, token_count, embedding) in enumerate(document.chunks):
-                    next_chunk_id += 1
-                    chunk_rows.append(
-                        (
-                            next_chunk_id,
-                            document_id_text,
-                            content,
-                            chunk_index,
-                            token_count,
-                            now_timestamp,
-                        )
-                    )
-                    vector_rows.append((next_chunk_id, _embedding_blob(embedding)))
+                _upsert_document_row(conn, document_id_text, document, now_timestamp)
+                _insert_document_tags(conn, document_id_text, document.tags)
+                _insert_document_chunks(conn, document_id_text, document.chunks, now_timestamp)
                 results.append(
                     DocumentChunkUpsertResult(
                         document_id=document_id,
@@ -376,41 +346,9 @@ class SQLiteStore:
                     )
                 )
 
-            _delete_document_children(conn, existing_document_ids)
-            conn.executemany(
-                """
-                INSERT INTO documents(
-                    id, type, title, source, content_hash, created_at, updated_at, metadata
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    type = excluded.type,
-                    title = excluded.title,
-                    source = excluded.source,
-                    content_hash = excluded.content_hash,
-                    updated_at = excluded.updated_at,
-                    metadata = excluded.metadata
-                """,
-                document_rows,
-            )
-            conn.executemany(
-                "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
-                tag_rows,
-            )
-            conn.executemany(
-                """
-                INSERT INTO chunks(id, document_id, content, chunk_index, token_count, created_at)
-                VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                chunk_rows,
-            )
-            conn.executemany(
-                "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-                vector_rows,
-            )
             return results
 
-        return await self.write(run)
+        return cast(list[DocumentChunkUpsertResult], await self.write(run))
 
     async def delete_document(self, document_id: UUID) -> tuple[int, int]:
         def run(conn: apsw.Connection) -> tuple[int, int]:
@@ -570,6 +508,18 @@ def _batched[T](items: list[T], size: int) -> list[list[T]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def _existing_document_ids(conn: apsw.Connection, document_ids: list[UUID]) -> set[str]:
+    existing_ids: set[str] = set()
+    for id_batch in _batched([str(document_id) for document_id in document_ids], 900):
+        placeholders = ",".join("?" for _ in id_batch)
+        rows = conn.cursor().execute(
+            f"SELECT id FROM documents WHERE id IN ({placeholders})",
+            id_batch,
+        )
+        existing_ids.update(str(row[0]) for row in rows)
+    return existing_ids
+
+
 def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) -> None:
     if not document_ids:
         return
@@ -577,6 +527,67 @@ def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) ->
         placeholders = ",".join("?" for _ in document_id_batch)
         conn.execute(f"DELETE FROM chunks WHERE document_id IN ({placeholders})", document_id_batch)
         conn.execute(f"DELETE FROM tags WHERE document_id IN ({placeholders})", document_id_batch)
+
+
+def _upsert_document_row(
+    conn: apsw.Connection,
+    document_id: str,
+    document: DocumentChunkUpsert,
+    now_timestamp: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO documents(
+            id, type, title, source, content_hash, created_at, updated_at, metadata
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            type = excluded.type,
+            title = excluded.title,
+            source = excluded.source,
+            content_hash = excluded.content_hash,
+            updated_at = excluded.updated_at,
+            metadata = excluded.metadata
+        """,
+        (
+            document_id,
+            str(document.doc_type),
+            document.title,
+            document.source,
+            document.content_hash,
+            now_timestamp,
+            now_timestamp,
+            json_dumps(document.metadata),
+        ),
+    )
+
+
+def _insert_document_tags(conn: apsw.Connection, document_id: str, tags: list[str]) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
+        [(document_id, tag) for tag in tags],
+    )
+
+
+def _insert_document_chunks(
+    conn: apsw.Connection,
+    document_id: str,
+    chunks: list[tuple[str, int, list[float]]],
+    now_timestamp: str,
+) -> None:
+    for chunk_index, (content, token_count, embedding) in enumerate(chunks):
+        conn.execute(
+            """
+            INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (document_id, content, chunk_index, token_count, now_timestamp),
+        )
+        chunk_id = conn.last_insert_rowid()
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+            (chunk_id, _embedding_blob(embedding)),
+        )
 
 
 def _document_select_sql() -> str:
