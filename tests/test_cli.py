@@ -14,6 +14,7 @@ from mouseion.__main__ import (
     _ensure_ollama_model,
     _model_names_match,
     _nuke_db,
+    _recompute_edges,
     build_parser,
 )
 from mouseion.config import Settings
@@ -51,6 +52,12 @@ def test_status_parser() -> None:
     args = build_parser().parse_args(["status"])
 
     assert args.command == "status"
+
+
+def test_recompute_edges_parser() -> None:
+    args = build_parser().parse_args(["recompute-edges"])
+
+    assert args.command == "recompute-edges"
 
 
 def test_parser_requires_command() -> None:
@@ -173,6 +180,53 @@ def test_status_handles_missing_local_database(
     assert status["stats"]["edges"] == {"total": 0, "related": 0, "similar": 0}
 
 
+async def test_recompute_edges_uses_daemon_when_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+
+    def fake_mouseion_json(
+        base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
+    ) -> dict[str, object]:
+        assert base_url == "http://127.0.0.1:7778"
+        assert path == "api/recompute_edges"
+        assert method == "POST"
+        return {"chunks_processed": 2, "edges_created": 1, "duration_seconds": 0.5}
+
+    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
+
+    result = await _recompute_edges(settings)
+
+    assert result == {
+        "source": "daemon",
+        "chunks_processed": 2,
+        "edges_created": 1,
+        "duration_seconds": 0.5,
+    }
+
+
+async def test_recompute_edges_handles_missing_local_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+
+    def fake_mouseion_json(
+        base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
+    ) -> dict[str, object]:
+        raise URLError("daemon offline")
+
+    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
+
+    result = await _recompute_edges(settings)
+
+    assert result == {
+        "source": "local database (not found)",
+        "chunks_processed": 0,
+        "edges_created": 0,
+        "duration_seconds": 0.0,
+    }
+
+
 def test_nuke_db_aborts_without_exact_confirmation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -230,9 +284,7 @@ def _create_status_test_database(path: Path) -> None:
         conn.execute("CREATE TABLE related_to(from_doc TEXT, to_doc TEXT, label TEXT)")
         conn.execute("CREATE TABLE similar_to(from_chunk INTEGER, to_chunk INTEGER)")
         conn.execute("INSERT INTO documents(id, type) VALUES('1', 'memory'), ('2', 'url')")
-        conn.execute(
-            "INSERT INTO chunks(id, document_id) VALUES(1, '1'), (2, '1'), (3, '2')"
-        )
+        conn.execute("INSERT INTO chunks(id, document_id) VALUES(1, '1'), (2, '1'), (3, '2')")
         conn.execute("INSERT INTO tags(document_id, tag) VALUES('1', 'a'), ('2', 'b')")
         conn.execute("INSERT INTO related_to(from_doc, to_doc, label) VALUES('1', '2', '')")
         conn.execute("INSERT INTO similar_to(from_chunk, to_chunk) VALUES(1, 2), (2, 3)")

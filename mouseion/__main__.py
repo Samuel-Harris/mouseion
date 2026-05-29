@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import time
@@ -16,6 +17,8 @@ import apsw
 import uvicorn
 
 from mouseion.config import Settings
+from mouseion.services.graph import GraphService
+from mouseion.storage.db import SQLiteStore
 from mouseion.support.logging_config import configure_logging, get_logger
 
 OLLAMA_START_TIMEOUT_SECONDS = 20.0
@@ -35,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not start Ollama or pull the embedding model before serving",
     )
     subparsers.add_parser("status", help="Show daemon status and database summary stats")
+    subparsers.add_parser("recompute-edges", help="Recompute similar_to graph edges")
     nuke_db = subparsers.add_parser("nuke-db", help="Delete the mouseion SQLite database")
     nuke_db.add_argument(
         "-y",
@@ -65,8 +69,45 @@ def main() -> None:
             )
     elif args.command == "status":
         _print_status(_collect_status(settings))
+    elif args.command == "recompute-edges":
+        _print_recompute_edges(asyncio.run(_recompute_edges(settings)))
     elif args.command == "nuke-db":
         _nuke_db(settings, assume_yes=args.yes)
+
+
+async def _recompute_edges(settings: Settings) -> dict[str, Any]:
+    daemon_url = _mouseion_base_url(settings)
+    try:
+        result = _mouseion_json(
+            daemon_url,
+            "api/recompute_edges",
+            method="POST",
+            timeout=STATUS_TIMEOUT_SECONDS,
+        )
+        return {"source": "daemon", **result}
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError):
+        if not settings.sqlite_path.exists():
+            return {
+                "source": "local database (not found)",
+                "chunks_processed": 0,
+                "edges_created": 0,
+                "duration_seconds": 0.0,
+            }
+        store = SQLiteStore(settings)
+        await store.open()
+        try:
+            result = await GraphService(store, settings).recompute_all()
+        finally:
+            await store.close()
+        return {"source": "local database", **result}
+
+
+def _print_recompute_edges(result: dict[str, Any]) -> None:
+    print("Mouseion edge recompute")
+    print(f"Source: {result['source']}")
+    print(f"Chunks processed: {int(result.get('chunks_processed', 0))}")
+    print(f"Edges created: {int(result.get('edges_created', 0))}")
+    print(f"Duration seconds: {float(result.get('duration_seconds', 0.0)):.3f}")
 
 
 def _collect_status(settings: Settings) -> dict[str, Any]:
@@ -116,8 +157,10 @@ def _mouseion_base_url(settings: Settings) -> str:
     return f"{host.rstrip('/')}:{settings.mouseion_port}"
 
 
-def _mouseion_json(base_url: str, path: str, *, timeout: float = 10) -> dict[str, Any]:
-    request = Request(urljoin(base_url.rstrip("/") + "/", path))
+def _mouseion_json(
+    base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
+) -> dict[str, Any]:
+    request = Request(urljoin(base_url.rstrip("/") + "/", path), method=method)
     with urlopen(request, timeout=timeout) as response:
         return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
 

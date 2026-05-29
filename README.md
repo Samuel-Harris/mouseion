@@ -49,6 +49,12 @@ Show whether the daemon is running and print summary stats:
 uv run mouseion status
 ```
 
+Recompute `similar_to` graph edges after bulk imports:
+
+```bash
+uv run mouseion recompute-edges
+```
+
 ## Configuration
 
 Settings are loaded from `.env` and environment variables:
