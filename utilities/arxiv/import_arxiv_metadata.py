@@ -35,6 +35,7 @@ from mouseion.domain.models import (
     IngestedContent,
     normalize_tags,
 )
+from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.embedder import Embedder
 from mouseion.ingest.ingestor import Ingestor
@@ -323,9 +324,10 @@ async def import_arxiv_metadata(
     if options.dry_run:
         dry_lookup = DryRunDocumentLookup(settings.sqlite_path)
     else:
+        active_embedder = active_embedder or Embedder(settings)
+        await ensure_embedding_backend_ready(active_embedder)
         store = SQLiteStore(settings)
         await store.open()
-        active_embedder = active_embedder or Embedder(settings)
         service = MouseionService(
             store,
             Ingestor(settings),
@@ -491,9 +493,18 @@ async def flush_batch(
         stats.updated += int(output["updated"])
         stats.skipped += int(output["skipped"])
         stats.edges_created += int(output["edges_created"])
+    except EmbeddingError:
+        raise
     except Exception as exc:  # noqa: BLE001
         stats.failed += len(batch)
         print(f"failed to import batch of {len(batch)} papers: {exc}", file=sys.stderr)
+
+
+async def ensure_embedding_backend_ready(embedder: object) -> None:
+    ensure_ready = getattr(embedder, "ensure_ready", None)
+    if ensure_ready is None:
+        return
+    await ensure_ready()
 
 
 def batched[T](items: list[T], size: int) -> list[list[T]]:
@@ -676,11 +687,19 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
     )
 
 
-async def async_main(argv: list[str] | None = None) -> int:
+async def async_main(
+    argv: list[str] | None = None,
+    *,
+    settings: Settings | None = None,
+    embedder: Embedder | None = None,
+) -> int:
     options = parse_args(argv)
     try:
-        stats = await import_arxiv_metadata(options)
+        stats = await import_arxiv_metadata(options, settings=settings, embedder=embedder)
     except MissingInputFileError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except EmbeddingError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     print(json.dumps(stats.as_dict(), indent=2, sort_keys=True))

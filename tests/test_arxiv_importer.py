@@ -7,6 +7,7 @@ import pytest
 
 from mouseion.config import Settings
 from mouseion.domain.models import SearchInput
+from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
@@ -32,6 +33,32 @@ class RecordingEmbedder(FakeEmbedder):
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(texts)
+        return await super().embed_many(texts)
+
+
+class FailingEmbedder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def embed(self, text: str) -> list[float]:
+        return (await self.embed_many([text]))[0]
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        raise EmbeddingError("embedding backend unavailable")
+
+
+class ReadinessFailingEmbedder(FakeEmbedder):
+    def __init__(self) -> None:
+        self.ready_calls = 0
+        self.embed_calls = 0
+
+    async def ensure_ready(self) -> None:
+        self.ready_calls += 1
+        raise EmbeddingError("embedding backend unavailable")
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        self.embed_calls += 1
         return await super().embed_many(texts)
 
 
@@ -161,7 +188,6 @@ async def test_dry_run_reports_counts_without_document_writes(
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
 
     rerun_embedder = RecordingEmbedder()
-    rerun_embedder = RecordingEmbedder()
     stats = await import_arxiv_metadata(
         ImportOptions(
             input=arxiv_jsonl,
@@ -202,6 +228,78 @@ async def test_cli_asks_user_to_download_missing_input(
         "https://www.kaggle.com/datasets/Cornell-University/arxiv?resource=download" in captured.err
     )
     assert "Please download" in captured.err
+
+
+async def test_import_fails_fast_when_embedding_backend_is_unavailable(
+    tmp_path: Path, categories_json: Path, arxiv_jsonl: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    embedder = FailingEmbedder()
+
+    with pytest.raises(EmbeddingError, match="embedding backend unavailable"):
+        await import_arxiv_metadata(
+            ImportOptions(
+                input=arxiv_jsonl,
+                categories_json=categories_json,
+                groups=("computer-science",),
+                batch_size=1,
+                progress_every=0,
+            ),
+            settings=settings,
+            embedder=embedder,  # type: ignore[arg-type]
+        )
+
+    assert embedder.calls == 1
+
+
+async def test_import_checks_embedding_backend_before_scanning_records(
+    tmp_path: Path, categories_json: Path, arxiv_jsonl: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    embedder = ReadinessFailingEmbedder()
+
+    with pytest.raises(EmbeddingError, match="embedding backend unavailable"):
+        await import_arxiv_metadata(
+            ImportOptions(
+                input=arxiv_jsonl,
+                categories_json=categories_json,
+                groups=("computer-science",),
+                progress_every=0,
+            ),
+            settings=settings,
+            embedder=embedder,  # type: ignore[arg-type]
+        )
+
+    assert embedder.ready_calls == 1
+    assert embedder.embed_calls == 0
+    assert not settings.sqlite_path.exists()
+
+
+async def test_cli_reports_embedding_backend_error_once(
+    tmp_path: Path, categories_json: Path, arxiv_jsonl: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+
+    status = await async_main(
+        [
+            "--input",
+            str(arxiv_jsonl),
+            "--categories-json",
+            str(categories_json),
+            "--groups",
+            "computer-science",
+            "--batch-size",
+            "1",
+            "--progress-every",
+            "0",
+        ],
+        settings=settings,
+        embedder=FailingEmbedder(),  # type: ignore[arg-type]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.err.count("embedding backend unavailable") == 1
 
 
 async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
