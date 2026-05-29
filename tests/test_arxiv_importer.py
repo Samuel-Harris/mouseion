@@ -17,7 +17,14 @@ from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
-from utilities.arxiv.import_arxiv_metadata import ImportOptions, async_main, import_arxiv_metadata
+from utilities.arxiv.import_arxiv_metadata import (
+    ImportOptions,
+    async_main,
+    category_filter_codes,
+    import_arxiv_metadata,
+    load_category_catalog,
+    raw_categories_match_filter,
+)
 
 
 class FakeEmbedder:
@@ -508,6 +515,32 @@ async def test_group_and_category_filters_use_union_semantics(
     )
 
     assert stats.selected == 2
+
+
+def test_category_filter_codes_expand_requested_groups(categories_json: Path) -> None:
+    catalog = load_category_catalog(categories_json)
+
+    codes = category_filter_codes(
+        catalog,
+        requested_groups={"computer-science"},
+        requested_categories={"stat.ml"},
+    )
+
+    assert codes == {"cs.ai", "cs.cg", "stat.ml"}
+
+
+def test_raw_category_prefilter_matches_exact_codes_case_insensitively() -> None:
+    line = b'{"id":"1234.0001","categories":"cs.AI stat.ML","title":"Paper"}'
+
+    assert raw_categories_match_filter(line, {"cs.ai"})
+    assert raw_categories_match_filter(line, {"stat.ml"})
+    assert not raw_categories_match_filter(line, {"cs.a"})
+
+
+def test_raw_category_prefilter_handles_escaped_values() -> None:
+    line = b'{"id":"1234.0001","categories":"cs.AI\\u0020stat.ML","title":"Paper"}'
+
+    assert raw_categories_match_filter(line, {"stat.ml"})
 
 
 async def test_unknown_categories_are_imported_and_reported(
