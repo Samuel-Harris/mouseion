@@ -12,6 +12,7 @@ from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+import apsw
 import uvicorn
 
 from mouseion.config import Settings
@@ -20,10 +21,11 @@ from mouseion.support.logging_config import configure_logging, get_logger
 OLLAMA_START_TIMEOUT_SECONDS = 20.0
 OLLAMA_POLL_SECONDS = 0.25
 NUKE_DB_CONFIRMATION = "nuke mouseion db"
+STATUS_TIMEOUT_SECONDS = 2.0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="museion")
+    parser = argparse.ArgumentParser(prog="mouseion")
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve = subparsers.add_parser("serve", help="Start the mouseion daemon")
     serve.add_argument(
@@ -32,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="manage_ollama",
         help="Do not start Ollama or pull the embedding model before serving",
     )
+    subparsers.add_parser("status", help="Show daemon status and database summary stats")
     nuke_db = subparsers.add_parser("nuke-db", help="Delete the mouseion SQLite database")
     nuke_db.add_argument(
         "-y",
@@ -60,8 +63,148 @@ def main() -> None:
                 port=settings.mouseion_port,
                 log_config=None,
             )
+    elif args.command == "status":
+        _print_status(_collect_status(settings))
     elif args.command == "nuke-db":
         _nuke_db(settings, assume_yes=args.yes)
+
+
+def _collect_status(settings: Settings) -> dict[str, Any]:
+    daemon_url = _mouseion_base_url(settings)
+    try:
+        stats = _mouseion_json(daemon_url, "api/stats", timeout=STATUS_TIMEOUT_SECONDS)
+        return {
+            "running": True,
+            "daemon_url": daemon_url,
+            "database": str(settings.sqlite_path),
+            "stats_source": "daemon",
+            "stats": _normalize_stats(stats),
+        }
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError):
+        local = _local_database_stats(settings)
+        return {
+            "running": False,
+            "daemon_url": daemon_url,
+            "database": str(settings.sqlite_path),
+            "stats_source": local["source"],
+            "stats": local["stats"],
+        }
+
+
+def _print_status(status: dict[str, Any]) -> None:
+    stats = status["stats"]
+    edges = stats["edges"]
+    print("Mouseion status")
+    print(f"Running: {'yes' if status['running'] else 'no'}")
+    print(f"Daemon: {status['daemon_url']}")
+    print(f"Database: {status['database']}")
+    print(f"Stats source: {status['stats_source']}")
+    print(f"Documents: {stats['documents']}")
+    for doc_type, total in stats["documents_by_type"].items():
+        print(f"  {doc_type}: {total}")
+    print(f"Chunks: {stats['chunks']}")
+    print(f"Edges: {edges['total']}")
+    print(f"  related: {edges['related']}")
+    print(f"  similar: {edges['similar']}")
+    print(f"Tags: {stats['tags']}")
+
+
+def _mouseion_base_url(settings: Settings) -> str:
+    host = settings.mouseion_host
+    if "://" not in host:
+        host = f"http://{host}"
+    return f"{host.rstrip('/')}:{settings.mouseion_port}"
+
+
+def _mouseion_json(base_url: str, path: str, *, timeout: float = 10) -> dict[str, Any]:
+    request = Request(urljoin(base_url.rstrip("/") + "/", path))
+    with urlopen(request, timeout=timeout) as response:
+        return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
+
+
+def _local_database_stats(settings: Settings) -> dict[str, Any]:
+    if not settings.sqlite_path.exists():
+        return {"source": "local database (not found)", "stats": _empty_stats()}
+    try:
+        conn = apsw.Connection(str(settings.sqlite_path), flags=apsw.SQLITE_OPEN_READONLY)
+        try:
+            return {"source": "local database", "stats": _stats_from_connection(conn)}
+        finally:
+            conn.close()
+    except apsw.Error:
+        return {"source": "local database (unreadable)", "stats": _empty_stats()}
+
+
+def _stats_from_connection(conn: apsw.Connection) -> dict[str, Any]:
+    document_types: dict[str, int] = {}
+    if _table_exists(conn, "documents"):
+        for doc_type, total in conn.execute(
+            "SELECT type, count(*) FROM documents GROUP BY type ORDER BY type"
+        ):
+            document_types[str(doc_type)] = int(total)
+
+    related_edges = _count_table(conn, "related_to")
+    similar_edges = _count_table(conn, "similar_to")
+    return {
+        "documents": _count_table(conn, "documents"),
+        "chunks": _count_table(conn, "chunks"),
+        "tags": _count_table(conn, "tags"),
+        "edges": {
+            "total": related_edges + similar_edges,
+            "related": related_edges,
+            "similar": similar_edges,
+        },
+        "documents_by_type": document_types,
+    }
+
+
+def _count_table(conn: apsw.Connection, table: str) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    row = next(conn.execute(f"SELECT count(*) FROM {table}"))
+    return int(row[0])
+
+
+def _table_exists(conn: apsw.Connection, table: str) -> bool:
+    row = next(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ),
+        None,
+    )
+    return row is not None
+
+
+def _empty_stats() -> dict[str, Any]:
+    return {
+        "documents": 0,
+        "chunks": 0,
+        "tags": 0,
+        "edges": {"total": 0, "related": 0, "similar": 0},
+        "documents_by_type": {},
+    }
+
+
+def _normalize_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    normalized = _empty_stats()
+    normalized["documents"] = int(stats.get("documents", 0))
+    normalized["chunks"] = int(stats.get("chunks", 0))
+    normalized["tags"] = int(stats.get("tags", 0))
+
+    edges = stats.get("edges")
+    if isinstance(edges, dict):
+        related = int(edges.get("related", 0))
+        similar = int(edges.get("similar", 0))
+        total = int(edges.get("total", related + similar))
+        normalized["edges"] = {"total": total, "related": related, "similar": similar}
+
+    documents_by_type = stats.get("documents_by_type")
+    if isinstance(documents_by_type, dict):
+        normalized["documents_by_type"] = {
+            str(doc_type): int(total) for doc_type, total in documents_by_type.items()
+        }
+    return normalized
 
 
 def _nuke_db(settings: Settings, *, assume_yes: bool = False) -> list[Path]:

@@ -148,6 +148,26 @@ async def test_similarity_edges_are_stored_once_as_canonical_pairs(
     assert rows == [{"from_chunk": 1, "to_chunk": 2}]
 
 
+async def test_service_stats_include_documents_chunks_and_edges(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    first = await service.add_memory(AddMemoryInput(content="first stats document", tags=["stats"]))
+    second = await service.add_memory(AddMemoryInput(content="second stats document", tags=[]))
+    await service.relate(
+        RelateInput(from_id=UUID(first["memory_id"]), to_id=UUID(second["memory_id"]))
+    )
+    await service.recompute_edges()
+
+    stats = await service.stats()
+
+    assert stats["documents"] == 2
+    assert stats["documents_by_type"] == {"memory": 2}
+    assert stats["chunks"] == 2
+    assert stats["tags"] == 1
+    assert stats["edges"] == {"total": 2, "related": 1, "similar": 1}
+
+
 async def test_delete_cascades_chunks_fts_vectors_and_edges(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:

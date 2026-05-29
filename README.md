@@ -18,13 +18,13 @@ uv sync
 Start the daemon:
 
 ```bash
-uv run museion serve
+uv run mouseion serve
 ```
 
 By default this starts `ollama serve` if needed and pulls `EMBEDDING_MODEL` when it is missing. If you run Ollama yourself:
 
 ```bash
-uv run museion serve --no-ollama
+uv run mouseion serve --no-ollama
 ```
 
 The web UI is served at `http://127.0.0.1:7778/`. MCP Streamable HTTP is mounted at `http://127.0.0.1:7778/mcp`.
@@ -32,10 +32,16 @@ The web UI is served at `http://127.0.0.1:7778/`. MCP Streamable HTTP is mounted
 Delete the SQLite database files after an explicit confirmation prompt:
 
 ```bash
-uv run museion nuke-db
+uv run mouseion nuke-db
 ```
 
 This removes `mouseion.db`, `mouseion.db-wal`, and `mouseion.db-shm` only. Stop the daemon first.
+
+Show whether the daemon is running and print summary stats:
+
+```bash
+uv run mouseion status
+```
 
 ## Configuration
 

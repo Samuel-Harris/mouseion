@@ -124,14 +124,46 @@ class MouseionService:
         return await self.exporter.export()
 
     async def stats(self) -> dict:
-        docs = await self.store.execute("SELECT count(*) AS total FROM documents")
-        chunks = await self.store.execute("SELECT count(*) AS total FROM chunks")
-        doc_row = docs.first()
-        chunk_row = chunks.first()
+        counts = await self._table_counts(
+            {
+                "documents": "documents",
+                "chunks": "chunks",
+                "tags": "tags",
+                "related_edges": "related_to",
+                "similar_edges": "similar_to",
+            }
+        )
+        document_types = await self.store.execute(
+            """
+            SELECT type, count(*) AS total
+            FROM documents
+            GROUP BY type
+            ORDER BY type
+            """
+        )
+        related_edges = counts["related_edges"]
+        similar_edges = counts["similar_edges"]
         return {
-            "documents": int(doc_row["total"] if doc_row else 0),
-            "chunks": int(chunk_row["total"] if chunk_row else 0),
+            "documents": counts["documents"],
+            "chunks": counts["chunks"],
+            "tags": counts["tags"],
+            "edges": {
+                "total": related_edges + similar_edges,
+                "related": related_edges,
+                "similar": similar_edges,
+            },
+            "documents_by_type": {
+                str(row["type"]): int(row["total"]) for row in document_types.rows
+            },
         }
+
+    async def _table_counts(self, tables: dict[str, str]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for key, table in tables.items():
+            result = await self.store.execute(f"SELECT count(*) AS total FROM {table}")
+            row = result.first()
+            counts[key] = int(row["total"] if row else 0)
+        return counts
 
     async def _ingest(self, content: IngestedContent, tags: list[str]) -> dict:
         content_hash = canonical_text_hash(content.content)

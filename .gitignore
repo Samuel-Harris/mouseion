@@ -221,3 +221,9 @@ __marimo__/
 data/
 repos/*
 !repos/.gitignore
+
+# Raw data for processing
+raw_data/
+
+# MacOS
+.DS_Store
