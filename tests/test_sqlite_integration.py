@@ -43,6 +43,11 @@ class FakeEmbedder:
         return [[0.0] * 767 + [1.0] for _ in texts]
 
 
+class OrthogonalSearchEmbedder(FakeEmbedder):
+    async def embed(self, text: str) -> list[float]:
+        return [1.0] + [0.0] * 767
+
+
 @pytest.fixture
 async def mouseion_service(tmp_path: Path) -> AsyncIterator[tuple[SQLiteStore, MouseionService]]:
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
@@ -141,6 +146,92 @@ async def test_search_filter_is_applied_before_candidate_limit(
 
     assert len(result["results"]) == 1
     assert result["results"][0]["document"]["tags"] == ["target"]
+
+
+async def test_exact_lexical_match_beats_unhelpful_vector_rank(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    await service.add_memory(AddMemoryInput(content="Irrelevant first memory.", tags=[]))
+    await service.add_memory(
+        AddMemoryInput(content="Waterfall Transformer exact title and phrase.", tags=[])
+    )
+
+    result = await service.search(SearchInput(query="Waterfall Transformer", top_k=2))
+
+    assert result["results"][0]["content"] == "Waterfall Transformer exact title and phrase."
+    assert "lexical" in result["results"][0]["match"]
+
+
+async def test_plain_search_handles_punctuation_and_source_metadata(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder, service.graph)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "arxiv:2411.18944",
+                "Pose estimation content without the identifier.",
+                title="Waterfall Transformer for Multi-person Pose Estimation",
+            )
+        ],
+        edge_policy="skip",
+    )
+
+    result = await service.search(SearchInput(query="2411.18944", top_k=3))
+
+    assert result["results"][0]["document"]["source"] == "arxiv:2411.18944"
+
+
+async def test_search_indexes_metadata_and_tags(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder, service.graph)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "metadata:paper",
+                "Body text does not contain the author name.",
+                tags=["arxiv:category:cs.ir"],
+                metadata={"authors": "Navin Ranjan", "categories": "cs.IR"},
+            )
+        ],
+        edge_policy="skip",
+    )
+
+    author_result = await service.search(SearchInput(query="Navin Ranjan", top_k=3))
+    category_result = await service.search(SearchInput(query="cs.IR", top_k=3))
+
+    assert author_result["results"][0]["document"]["source"] == "metadata:paper"
+    assert category_result["results"][0]["document"]["source"] == "metadata:paper"
+
+
+async def test_vector_only_search_requires_confident_similarity(tmp_path: Path) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    store = SQLiteStore(settings)
+    await store.open()
+    embedder = OrthogonalSearchEmbedder()
+    graph = GraphService(store, settings)
+    service = MouseionService(
+        store,
+        Ingestor(settings),
+        Chunker(settings),
+        embedder,  # type: ignore[arg-type]
+        SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
+        graph,
+        RepoService(settings),
+        Exporter(settings, store),
+    )
+    try:
+        await service.add_memory(AddMemoryInput(content="Known stored memory.", tags=[]))
+        result = await service.search(SearchInput(query="unrelatedzzzz", top_k=3))
+    finally:
+        await store.close()
+
+    assert result["results"] == []
+    assert result["message"] == "No confident results."
 
 
 async def test_similarity_edges_are_stored_once_as_canonical_pairs(
@@ -298,6 +389,7 @@ async def test_delete_cascades_chunks_fts_vectors_and_edges(
     counts = {
         "chunks": "SELECT count(*) AS total FROM chunks",
         "fts": "SELECT count(*) AS total FROM chunks_fts",
+        "search_fts": "SELECT count(*) AS total FROM search_fts",
         "vectors": "SELECT count(*) AS total FROM chunk_vectors",
         "similar_to": "SELECT count(*) AS total FROM similar_to",
     }
@@ -306,14 +398,21 @@ async def test_delete_cascades_chunks_fts_vectors_and_edges(
         assert int(result.first()["total"]) == 0  # type: ignore[index]
 
 
-def _batch_item(source: str, content: str, tags: list[str] | None = None) -> BatchIngestItem:
+def _batch_item(
+    source: str,
+    content: str,
+    tags: list[str] | None = None,
+    *,
+    title: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> BatchIngestItem:
     return BatchIngestItem(
         content=IngestedContent(
-            title=source,
+            title=title or source,
             source=source,
             type=DocumentType.DOCUMENT,
             content=content,
-            metadata={"source": source},
+            metadata=metadata or {"source": source},
         ),
         tags=tags or [],
         chunks=[ChunkText(content=content, token_count=len(content.split()))],

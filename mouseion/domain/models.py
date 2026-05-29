@@ -100,6 +100,7 @@ class SearchInput(BaseModel):
     top_k: int = Field(default=10, ge=1, le=100)
     include_graph_neighbours: bool = False
     filter: SearchFilter | None = None
+    search_syntax: Literal["plain", "advanced"] = "plain"
 
 
 class GetDocumentInput(BaseModel):

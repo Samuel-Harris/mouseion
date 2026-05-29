@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from mcp.server.fastmcp import FastMCP
@@ -55,14 +55,19 @@ def build_mcp(
         top_k: int = 10,
         include_graph_neighbours: bool = False,
         filter: dict[str, Any] | None = None,
+        search_syntax: str = "plain",
     ) -> dict[str, Any]:
         parsed_filter = SearchFilter.model_validate(filter) if filter else None
+        parsed_syntax: Literal["plain", "advanced"] = (
+            "advanced" if search_syntax == "advanced" else "plain"
+        )
         return await service().search(
             SearchInput(
                 query=query,
                 top_k=top_k,
                 include_graph_neighbours=include_graph_neighbours,
                 filter=parsed_filter,
+                search_syntax=parsed_syntax,
             )
         )
 

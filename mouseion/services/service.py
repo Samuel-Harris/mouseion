@@ -73,6 +73,7 @@ class MouseionService:
             top_k=input.top_k,
             include_graph_neighbours=input.include_graph_neighbours,
             filter=input.filter,
+            search_syntax=input.search_syntax,
         )
 
     async def get_document(self, input: GetDocumentInput) -> JsonDict:

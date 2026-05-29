@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,14 @@ class RankedHit:
     chunk_id: int
     score: float
     rank: int
+    source: str = ""
+
+
+@dataclass(slots=True)
+class FusedHit:
+    chunk_id: int
+    score: float
+    match: str
 
 
 @dataclass(slots=True)
@@ -38,22 +47,30 @@ class SearchService:
         top_k: int,
         include_graph_neighbours: bool = False,
         filter: SearchFilter | None = None,
+        search_syntax: str = "plain",
     ) -> dict[str, Any]:
+        query = query.strip()
+        if not query:
+            return {"results": [], "message": "Enter a search query."}
+        fusion_k = min(max(top_k * 8, 40), 200)
+        fts_hits = await self._fts_hits(query, fusion_k, filter, search_syntax=search_syntax)
         query_vector = await self.embedder.embed(query)
-        fusion_k = top_k * 3
         vec_hits = await self._vector_hits(query_vector, fusion_k, filter)
-        fts_hits = await self._fts_hits(query, fusion_k, filter)
-        fused = rrf_fuse([vec_hits, fts_hits], self.rrf_k)[:top_k]
+        fused = hybrid_fuse(fts_hits, vec_hits, top_k=top_k)
         results: list[dict[str, Any]] = []
-        for chunk_id, score in fused:
-            hydrated = await self._hydrate_chunk(chunk_id)
+        for hit in fused:
+            hydrated = await self._hydrate_chunk(hit.chunk_id)
             if hydrated is None:
                 continue
-            hydrated["score"] = score
+            hydrated["score"] = hit.score
+            hydrated["match"] = hit.match
             if include_graph_neighbours:
-                hydrated["graph_neighbours"] = await self.expand_similar_to(chunk_id, cap=3)
+                hydrated["graph_neighbours"] = await self.expand_similar_to(hit.chunk_id, cap=3)
             results.append(hydrated)
-        return {"results": results}
+        output: dict[str, Any] = {"results": results}
+        if not results:
+            output["message"] = "No confident results."
+        return output
 
     async def _vector_hits(
         self, query_vector: list[float], limit: int, filter: SearchFilter | None
@@ -86,27 +103,83 @@ class SearchService:
         ]
 
     async def _fts_hits(
-        self, query: str, limit: int, filter: SearchFilter | None
+        self,
+        query: str,
+        limit: int,
+        filter: SearchFilter | None,
+        *,
+        search_syntax: str = "plain",
     ) -> list[RankedHit]:
         sql_filter = _sql_filter(filter)
-        result = await self.store.execute(
-            f"""
-            SELECT f.rowid AS chunk_id,
-                   bm25(chunks_fts) AS score
-            FROM chunks_fts f
-            JOIN chunks c ON c.id = f.rowid
-            JOIN documents d ON d.id = c.document_id
-            WHERE chunks_fts MATCH ?
-            {sql_filter.clause}
-            ORDER BY score
-            LIMIT ?
-            """,
-            (query, *sql_filter.params, limit),
-        )
-        return [
-            RankedHit(chunk_id=int(row["chunk_id"]), score=float(row["score"]), rank=index + 1)
-            for index, row in enumerate(result.rows)
-        ]
+        fts_queries = _fts_queries(query, search_syntax)
+        if not fts_queries:
+            return []
+
+        for fts_query in fts_queries:
+            result = await self.store.execute(
+                f"""
+                SELECT f.rowid AS chunk_id,
+                       bm25(search_fts, 5.0, 4.0, 3.0, 2.0, 1.0) AS bm25_score,
+                       (
+                         CASE WHEN lower(d.title) = ? THEN 20.0 ELSE 0.0 END
+                         + CASE WHEN lower(d.source) = ? THEN 20.0 ELSE 0.0 END
+                         + CASE WHEN lower(d.title) LIKE ? ESCAPE '\\' THEN 8.0 ELSE 0.0 END
+                         + CASE WHEN lower(d.source) LIKE ? ESCAPE '\\' THEN 10.0 ELSE 0.0 END
+                         + CASE WHEN lower(c.content) LIKE ? ESCAPE '\\' THEN 3.0 ELSE 0.0 END
+                         + CASE
+                             WHEN EXISTS (
+                               SELECT 1
+                               FROM tags exact_tag
+                               WHERE exact_tag.document_id = d.id
+                                 AND exact_tag.tag = ?
+                             )
+                             THEN 8.0
+                             ELSE 0.0
+                           END
+                         + CASE
+                             WHEN EXISTS (
+                               SELECT 1
+                               FROM tags partial_tag
+                               WHERE partial_tag.document_id = d.id
+                                 AND partial_tag.tag LIKE ? ESCAPE '\\'
+                             )
+                             THEN 4.0
+                             ELSE 0.0
+                           END
+                       ) AS field_boost
+                FROM search_fts f
+                JOIN chunks c ON c.id = f.rowid
+                JOIN documents d ON d.id = c.document_id
+                WHERE search_fts MATCH ?
+                {sql_filter.clause}
+                ORDER BY bm25_score - field_boost
+                LIMIT ?
+                """,
+                (
+                    query.lower(),
+                    query.lower(),
+                    _like_contains_pattern(query),
+                    _like_contains_pattern(query),
+                    _like_contains_pattern(query),
+                    query.lower(),
+                    _like_contains_pattern(query),
+                    fts_query,
+                    *sql_filter.params,
+                    limit,
+                ),
+            )
+            hits = [
+                RankedHit(
+                    chunk_id=int(row["chunk_id"]),
+                    score=max(0.0, -float(row["bm25_score"])) + float(row["field_boost"]),
+                    rank=index + 1,
+                    source="lexical",
+                )
+                for index, row in enumerate(result.rows)
+            ]
+            if hits or search_syntax == "advanced":
+                return hits
+        return []
 
     async def _vector_search_window(self, limit: int, sql_filter: SqlFilter) -> int:
         if not sql_filter.active:
@@ -222,6 +295,63 @@ def rrf_fuse(hit_lists: list[list[RankedHit]], k: int) -> list[tuple[int, float]
         for hit in hits:
             scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + 1.0 / (k + hit.rank)
     return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def hybrid_fuse(
+    lexical_hits: list[RankedHit],
+    vector_hits: list[RankedHit],
+    *,
+    top_k: int,
+) -> list[FusedHit]:
+    scores: dict[int, float] = {}
+    sources: dict[int, set[str]] = {}
+
+    for hit in lexical_hits:
+        lexical_score = 2.0 + min(hit.score, 30.0) / 8.0 + 1.0 / hit.rank
+        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + lexical_score
+        sources.setdefault(hit.chunk_id, set()).add("lexical")
+
+    for hit in vector_hits:
+        if not lexical_hits and hit.score < 0.78:
+            continue
+        semantic_score = max(0.0, hit.score - 0.70) * 2.0 + 0.25 / hit.rank
+        if semantic_score <= 0:
+            continue
+        scores[hit.chunk_id] = scores.get(hit.chunk_id, 0.0) + semantic_score
+        sources.setdefault(hit.chunk_id, set()).add("semantic")
+
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: (
+            item[1],
+            "lexical" in sources.get(item[0], set()),
+            item[0] * -1,
+        ),
+        reverse=True,
+    )
+    return [
+        FusedHit(chunk_id=chunk_id, score=score, match="+".join(sorted(sources[chunk_id])))
+        for chunk_id, score in ranked[:top_k]
+    ]
+
+
+def _fts_queries(query: str, search_syntax: str) -> list[str]:
+    if search_syntax == "advanced":
+        return [query]
+
+    terms = re.findall(r"[\w]+", query, flags=re.UNICODE)
+    if not terms:
+        return []
+    quoted_terms = [f'"{term}"' for term in terms]
+    and_query = " ".join(quoted_terms)
+    if len(quoted_terms) == 1:
+        return [and_query]
+    return [and_query, " OR ".join(quoted_terms)]
+
+
+def _like_contains_pattern(query: str) -> str:
+    escaped = query.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _sql_filter(filter: SearchFilter | None) -> SqlFilter:

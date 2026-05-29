@@ -335,6 +335,14 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     assert "Neural Symbolic Planning" in chunks.first()["content"]  # type: ignore[index]
     assert "zeta planning" in chunks.first()["content"]  # type: ignore[index]
 
+    author_result = await service.search(SearchInput(query="Grace Hopper", top_k=3))
+    source_result = await service.search(SearchInput(query="1234.0001", top_k=3))
+    category_result = await service.search(SearchInput(query="stat.ML", top_k=3))
+
+    assert author_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
+    assert source_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
+    assert category_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
+
 
 async def test_metadata_importer_recomputes_edges_by_default(
     imported_service: tuple[SQLiteStore, MouseionService, Settings],

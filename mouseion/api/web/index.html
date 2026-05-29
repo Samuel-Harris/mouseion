@@ -44,9 +44,28 @@
         <form id="search-form" class="panel search-panel">
           <h2>Search</h2>
           <input id="search-input" placeholder="Search the mouseion" required />
+          <div class="inline-controls">
+            <select id="search-type" aria-label="Document type">
+              <option value="all">All types</option>
+              <option value="document">Documents</option>
+              <option value="memory">Memories</option>
+              <option value="url">URLs</option>
+              <option value="file">Files</option>
+            </select>
+            <select id="search-top-k" aria-label="Result count">
+              <option value="10">10 results</option>
+              <option value="25">25 results</option>
+              <option value="50">50 results</option>
+            </select>
+          </div>
+          <input id="search-tags" placeholder="filter tags, comma separated" />
           <label class="checkbox">
             <input id="search-neighbours" type="checkbox" />
             <span>Graph neighbours</span>
+          </label>
+          <label class="checkbox">
+            <input id="search-advanced" type="checkbox" />
+            <span>Advanced FTS syntax</span>
           </label>
           <button type="submit">Search</button>
         </form>

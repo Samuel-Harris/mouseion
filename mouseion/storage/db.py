@@ -17,7 +17,7 @@ from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
 from mouseion.support.utils import json_dumps, json_loads
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 EMBEDDING_DIMS = 768
 T = TypeVar("T")
 
@@ -136,6 +136,7 @@ class SQLiteStore:
                 conn.execute(statement)
             self._ensure_meta_sync(conn, "schema_version", SCHEMA_VERSION)
             self._ensure_meta_sync(conn, "last_recompute_at", "")
+            _backfill_search_fts(conn)
 
         await self.write(run)
 
@@ -335,7 +336,7 @@ class SQLiteStore:
 
                 _upsert_document_row(conn, document_id_text, document, now_timestamp)
                 _insert_document_tags(conn, document_id_text, document.tags)
-                _insert_document_chunks(conn, document_id_text, document.chunks, now_timestamp)
+                _insert_document_chunks(conn, document_id_text, document, now_timestamp)
                 results.append(
                     DocumentChunkUpsertResult(
                         document_id=document_id,
@@ -461,6 +462,21 @@ SCHEMA_STATEMENTS = [
     END
     """,
     """
+    CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+      title,
+      source,
+      tags,
+      metadata,
+      content,
+      tokenize='porter unicode61'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_search_ad AFTER DELETE ON chunks BEGIN
+      DELETE FROM search_fts WHERE rowid = old.id;
+    END
+    """,
+    """
     CREATE TABLE IF NOT EXISTS similar_to(
       from_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
       to_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
@@ -561,6 +577,31 @@ def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) ->
         conn.execute(f"DELETE FROM tags WHERE document_id IN ({placeholders})", document_id_batch)
 
 
+def _backfill_search_fts(conn: apsw.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO search_fts(rowid, title, source, tags, metadata, content)
+        SELECT c.id,
+               d.title,
+               d.source,
+               COALESCE(
+                 (
+                   SELECT group_concat(tag, ' ')
+                   FROM tags
+                   WHERE document_id = d.id
+                 ),
+                 ''
+               ) AS tags,
+               COALESCE(d.metadata, '') AS metadata,
+               c.content
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        LEFT JOIN search_fts f ON f.rowid = c.id
+        WHERE f.rowid IS NULL
+        """
+    )
+
+
 def _upsert_document_row(
     conn: apsw.Connection,
     document_id: str,
@@ -601,13 +642,39 @@ def _insert_document_tags(conn: apsw.Connection, document_id: str, tags: list[st
     )
 
 
+def _metadata_search_text(value: Any) -> str:
+    parts: list[str] = []
+
+    def collect(item: Any) -> None:
+        if item is None:
+            return
+        if isinstance(item, str | int | float | bool):
+            parts.append(str(item))
+            return
+        if isinstance(item, dict):
+            for key, nested in cast(dict[Any, Any], item).items():
+                parts.append(str(key))
+                collect(nested)
+            return
+        if isinstance(item, list | tuple):
+            for nested in cast(list[Any] | tuple[Any, ...], item):
+                collect(nested)
+            return
+        parts.append(str(item))
+
+    collect(value)
+    return " ".join(parts)
+
+
 def _insert_document_chunks(
     conn: apsw.Connection,
     document_id: str,
-    chunks: list[tuple[str, int, list[float]]],
+    document: DocumentChunkUpsert,
     now_timestamp: str,
 ) -> None:
-    for chunk_index, (content, token_count, embedding) in enumerate(chunks):
+    tags_text = " ".join(document.tags)
+    metadata_text = _metadata_search_text(document.metadata)
+    for chunk_index, (content, token_count, embedding) in enumerate(document.chunks):
         conn.execute(
             """
             INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
@@ -619,6 +686,13 @@ def _insert_document_chunks(
         conn.execute(
             "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
             (chunk_id, embedding_blob(embedding)),
+        )
+        conn.execute(
+            """
+            INSERT INTO search_fts(rowid, title, source, tags, metadata, content)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (chunk_id, document.title, document.source, tags_text, metadata_text, content),
         )
 
 
