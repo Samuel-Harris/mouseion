@@ -24,12 +24,12 @@ def test_hash_canonicalizes_whitespace() -> None:
 def test_rrf_fuse_combines_rank_sources() -> None:
     fused = rrf_fuse(
         [
-            [RankedHit("a", 0.9, 1), RankedHit("b", 0.7, 2)],
-            [RankedHit("b", 3.0, 1), RankedHit("c", 1.0, 2)],
+            [RankedHit(1, 0.9, 1), RankedHit(2, 0.7, 2)],
+            [RankedHit(2, 3.0, 1), RankedHit(3, 1.0, 2)],
         ],
         k=60,
     )
-    assert fused[0][0] == "b"
+    assert fused[0][0] == 2
 
 
 def test_deterministic_edge_id_is_stable() -> None:
@@ -42,4 +42,4 @@ def test_deterministic_edge_id_is_stable() -> None:
 
 def test_search_filter_rejects_unknown_type() -> None:
     with pytest.raises(ValueError):
-        SearchFilter(type="bad")
+        SearchFilter(type="bad")  # type: ignore[arg-type]

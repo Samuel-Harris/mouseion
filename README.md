@@ -2,6 +2,12 @@
 
 Mouseion is a local-first personal knowledge base. It runs as a single Python daemon, stores documents and chunks in SQLite with `sqlite-vec` and FTS5, embeds chunks through local Ollama, and exposes retrieval/admin operations through HTTP MCP tools plus a small web UI.
 
+## Name
+
+The name `Mouseion` refers to the Mouseion of Alexandria, an ancient institution associated with the Library of Alexandria. A mouseion was originally a place dedicated to the Muses, then came to describe centers of learning such as Plato's Academy and Aristotle's Lyceum. The Alexandrian Mouseion is remembered as an effort to gather leading scholars and collect the books known at the time.
+
+This project borrows the name for the same basic idea at a personal scale: a local place to collect, organize, relate, and retrieve knowledge.
+
 ## Runtime
 
 - Python 3.13
@@ -18,13 +24,13 @@ uv sync
 Start the daemon:
 
 ```bash
-uv run museion serve
+uv run mouseion serve
 ```
 
 By default this starts `ollama serve` if needed and pulls `EMBEDDING_MODEL` when it is missing. If you run Ollama yourself:
 
 ```bash
-uv run museion serve --no-ollama
+uv run mouseion serve --no-ollama
 ```
 
 The web UI is served at `http://127.0.0.1:7778/`. MCP Streamable HTTP is mounted at `http://127.0.0.1:7778/mcp`.
@@ -32,10 +38,22 @@ The web UI is served at `http://127.0.0.1:7778/`. MCP Streamable HTTP is mounted
 Delete the SQLite database files after an explicit confirmation prompt:
 
 ```bash
-uv run museion nuke-db
+uv run mouseion nuke-db
 ```
 
 This removes `mouseion.db`, `mouseion.db-wal`, and `mouseion.db-shm` only. Stop the daemon first.
+
+Show whether the daemon is running and print summary stats:
+
+```bash
+uv run mouseion status
+```
+
+Recompute `similar_to` graph edges after bulk imports:
+
+```bash
+uv run mouseion recompute-edges
+```
 
 ## Configuration
 
