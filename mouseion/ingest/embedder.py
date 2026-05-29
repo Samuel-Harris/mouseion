@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
-import anyio
 import ollama
+from anyio.to_thread import run_sync
 
 from mouseion.config import Settings
 from mouseion.errors import EmbeddingError
@@ -16,7 +17,7 @@ class Embedder:
     settings: Settings
 
     async def ensure_ready(self) -> None:
-        await anyio.to_thread.run_sync(self._ensure_ready_sync)
+        await run_sync(self._ensure_ready_sync)
 
     def _ensure_ready_sync(self) -> None:
         client = ollama.Client(host=self.settings.ollama_host)
@@ -34,7 +35,7 @@ class Embedder:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        return await anyio.to_thread.run_sync(self._embed_many_sync, texts)
+        return await run_sync(self._embed_many_sync, texts)
 
     def _embed_many_sync(self, texts: list[str]) -> list[list[float]]:
         client = ollama.Client(host=self.settings.ollama_host)
@@ -45,8 +46,14 @@ class Embedder:
                 f"Embedding backend failed for model {self.settings.embedding_model!r}: {exc}"
             ) from exc
 
-        embeddings = response.get("embeddings")
-        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+        embeddings_value = response.get("embeddings")
+        if not isinstance(embeddings_value, list):
+            raise EmbeddingError(
+                "Embedding backend returned invalid batch response "
+                f"for {self.settings.embedding_model!r}"
+            )
+        embeddings = cast(list[object], embeddings_value)
+        if len(embeddings) != len(texts):
             raise EmbeddingError(
                 "Embedding backend returned invalid batch response "
                 f"for {self.settings.embedding_model!r}"
@@ -54,10 +61,24 @@ class Embedder:
 
         vectors: list[list[float]] = []
         for embedding in embeddings:
-            if not isinstance(embedding, list) or len(embedding) != EMBEDDING_DIMENSIONS:
+            if not isinstance(embedding, list):
                 raise EmbeddingError(
                     "Embedding backend returned invalid vector dimensions "
                     f"for {self.settings.embedding_model!r}"
                 )
-            vectors.append([float(value) for value in embedding])
+            embedding_values = cast(list[object], embedding)
+            if len(embedding_values) != EMBEDDING_DIMENSIONS:
+                raise EmbeddingError(
+                    "Embedding backend returned invalid vector dimensions "
+                    f"for {self.settings.embedding_model!r}"
+                )
+            vector: list[float] = []
+            for value in embedding_values:
+                if not isinstance(value, int | float):
+                    raise EmbeddingError(
+                        "Embedding backend returned non-numeric vector value "
+                        f"for {self.settings.embedding_model!r}"
+                    )
+                vector.append(float(value))
+            vectors.append(vector)
         return vectors

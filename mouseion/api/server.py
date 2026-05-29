@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import shutil
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Any, cast
 from uuid import uuid4
 
 import structlog.contextvars
@@ -31,6 +31,8 @@ from mouseion.services.factory import open_services
 from mouseion.services.service import MouseionService
 from mouseion.support.logging_config import configure_logging, get_logger
 
+JsonDict = dict[str, Any]
+
 
 def create_app() -> FastAPI:
     settings = Settings()
@@ -41,7 +43,7 @@ def create_app() -> FastAPI:
     mcp_app = build_mcp(service_ref).streamable_http_app()
 
     @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         nonlocal tasks
         async with mcp_app.router.lifespan_context(mcp_app):
             settings.warn_if_non_loopback(logger)
@@ -58,8 +60,7 @@ def create_app() -> FastAPI:
                 try:
                     yield
                 finally:
-                    if tasks is not None:
-                        await tasks.stop()
+                    await tasks.stop()
                     logger.info("mouseion_daemon_stopped")
 
     app = FastAPI(title="Mouseion", lifespan=lifespan)
@@ -97,51 +98,51 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/api/stats")
-    async def api_stats(request: Request) -> dict:
+    async def api_stats(request: Request) -> JsonDict:
         return await _service(request).stats()
 
     @app.get("/api/documents")
-    async def api_documents(type: str = "all", limit: int = 50, offset: int = 0) -> dict:
+    async def api_documents(type: str = "all", limit: int = 50, offset: int = 0) -> JsonDict:
         return await service_ref["service"].list_documents(
             ListInput.model_validate({"type": type, "limit": limit, "offset": offset})
         )
 
     @app.get("/api/documents/{document_id}")
-    async def api_document(document_id: str, request: Request) -> dict:
+    async def api_document(document_id: str, request: Request) -> JsonDict:
         return await _service(request).get_document(
             GetDocumentInput.model_validate({"document_id": document_id})
         )
 
     @app.post("/api/url")
-    async def api_add_url(input: AddUrlInput, request: Request) -> dict:
+    async def api_add_url(input: AddUrlInput, request: Request) -> JsonDict:
         return await _service(request).add_url(input)
 
     @app.post("/api/memory")
-    async def api_add_memory(input: AddMemoryInput, request: Request) -> dict:
+    async def api_add_memory(input: AddMemoryInput, request: Request) -> JsonDict:
         return await _service(request).add_memory(input)
 
     @app.post("/api/repo")
-    async def api_add_repo(input: AddRepoInput, request: Request) -> dict:
+    async def api_add_repo(input: AddRepoInput, request: Request) -> JsonDict:
         return await _service(request).add_repo(input)
 
     @app.post("/api/search")
-    async def api_search(input: SearchInput, request: Request) -> dict:
+    async def api_search(input: SearchInput, request: Request) -> JsonDict:
         return await _service(request).search(input)
 
     @app.post("/api/relate")
-    async def api_relate(input: RelateInput, request: Request) -> dict:
+    async def api_relate(input: RelateInput, request: Request) -> JsonDict:
         return await _service(request).relate(input)
 
     @app.delete("/api/documents/{document_id}")
-    async def api_delete(document_id: str, request: Request) -> dict:
+    async def api_delete(document_id: str, request: Request) -> JsonDict:
         return await _service(request).delete(DeleteInput.model_validate({"id": document_id}))
 
     @app.post("/api/export")
-    async def api_export(request: Request) -> dict:
+    async def api_export(request: Request) -> JsonDict:
         return await _service(request).export()
 
     @app.post("/api/recompute_edges")
-    async def api_recompute_edges(request: Request) -> dict:
+    async def api_recompute_edges(request: Request) -> JsonDict:
         return await _service(request).recompute_edges()
 
     @app.post("/api/files")
@@ -149,7 +150,7 @@ def create_app() -> FastAPI:
         request: Request,
         file: Annotated[UploadFile, File()],
         tags: Annotated[str, Form()] = "",
-    ) -> dict:
+    ) -> JsonDict:
         upload_dir = settings.files_dir / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         destination = upload_dir / f"{uuid4()}-{Path(file.filename or 'upload').name}"

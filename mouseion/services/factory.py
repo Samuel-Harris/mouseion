@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -28,7 +28,7 @@ class ServiceBundle:
 @asynccontextmanager
 async def open_services(
     settings: Settings | None = None, *, embedder: Any | None = None
-) -> AsyncIterator[ServiceBundle]:
+) -> AsyncGenerator[ServiceBundle]:
     active_settings = settings or Settings()
     active_settings.ensure_directories()
     store = SQLiteStore(active_settings)

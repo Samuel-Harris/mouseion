@@ -13,7 +13,7 @@ from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from rich.console import Console
 from rich.progress import (
@@ -121,7 +121,7 @@ class ImportStats:
     skipped: int = 0
     failed: int = 0
     edges_created: int = 0
-    unresolved_categories: Counter[str] = field(default_factory=Counter)
+    unresolved_categories: Counter[str] = field(default_factory=Counter[str])
     elapsed_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -138,31 +138,34 @@ class ImportStats:
 
 
 def load_category_catalog(path: Path) -> CategoryCatalog:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw: object = json.loads(path.read_text(encoding="utf-8"))
     categories: dict[str, CategoryEntry] = {}
     groups: dict[str, str] = {}
 
     if not isinstance(raw, list):
         raise ValueError(f"Expected {path} to contain a list of arXiv category groups")
 
-    for group_item in raw:
+    for group_item in cast(list[object], raw):
         if not isinstance(group_item, dict):
             continue
-        for group_name, entries in group_item.items():
+        group_mapping = cast(dict[object, object], group_item)
+        for group_name, entries in group_mapping.items():
             group_slug = slugify(str(group_name))
             groups[group_slug] = str(group_name)
             if not isinstance(entries, list):
                 continue
-            for entry_item in entries:
+            for entry_item in cast(list[object], entries):
                 if not isinstance(entry_item, dict):
                     continue
-                for code, details in entry_item.items():
+                entry_mapping = cast(dict[object, object], entry_item)
+                for code, details in entry_mapping.items():
                     if not isinstance(details, dict):
                         continue
+                    details_mapping = cast(dict[object, object], details)
                     category = CategoryEntry(
                         code=str(code),
-                        name=str(details.get("name") or ""),
-                        description=str(details.get("description") or ""),
+                        name=str(details_mapping.get("name") or ""),
+                        description=str(details_mapping.get("description") or ""),
                         group=str(group_name),
                         group_slug=group_slug,
                     )
@@ -316,14 +319,15 @@ async def import_arxiv_metadata(
                         stats.skipped += 1
                         continue
                     try:
-                        record = json.loads(line)
+                        loaded_record: object = json.loads(line)
                     except json.JSONDecodeError as exc:
                         stats.failed += 1
                         print(f"line {line_number}: invalid JSON: {exc}", file=sys.stderr)
                         continue
-                    if not isinstance(record, dict):
+                    if not isinstance(loaded_record, dict):
                         stats.skipped += 1
                         continue
+                    record = cast(dict[str, Any], loaded_record)
 
                     paper = prepare_record(
                         record,

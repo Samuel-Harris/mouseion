@@ -12,7 +12,7 @@ class BackgroundTasks:
     def __init__(self, settings: Settings, graph: GraphService) -> None:
         self.settings = settings
         self.graph = graph
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
 
     def start(self) -> None:
         if self.settings.similar_edge_recompute_hours > 0:

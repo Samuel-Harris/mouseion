@@ -27,12 +27,16 @@ class Document(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def _empty_embedding() -> list[float]:
+    return []
+
+
 class Chunk(BaseModel):
     id: int
     document_id: UUID
     content: str
     chunk_index: int
-    embedding: list[float] = Field(default_factory=list)
+    embedding: list[float] = Field(default_factory=_empty_embedding)
     token_count: int
     created_at: datetime
 
@@ -130,6 +134,17 @@ class IngestedContent(BaseModel):
 class ChunkText(BaseModel):
     content: str
     token_count: int
+
+
+class BatchIngestItem(BaseModel):
+    content: IngestedContent
+    tags: list[str] = Field(default_factory=list)
+    chunks: list[ChunkText] | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_batch_tags(cls, value: list[str]) -> list[str]:
+        return normalize_tags(value)
 
 
 def normalize_tags(tags: list[str]) -> list[str]:

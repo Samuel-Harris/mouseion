@@ -9,7 +9,7 @@ import apsw
 
 from mouseion.config import Settings
 from mouseion.domain.models import utc_now
-from mouseion.storage.db import SQLiteStore, _embedding_blob
+from mouseion.storage.db import SQLiteStore, embedding_blob
 from mouseion.support.logging_config import get_logger
 
 
@@ -60,9 +60,9 @@ class GraphService:
             WHERE embedding MATCH ? AND k = ?
             ORDER BY distance
             """,
-            (_embedding_blob(embedding), limit),
+            (embedding_blob(embedding), limit),
         )
-        candidates = []
+        candidates: list[tuple[int, float]] = []
         for row in result.rows:
             other_id = int(row["chunk_id"])
             if other_id == chunk_id:

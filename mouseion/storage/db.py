@@ -6,12 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from struct import pack, unpack
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
 
-import anyio
 import apsw
 import sqlite_vec
+from anyio.to_thread import run_sync
 
 from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
@@ -19,6 +19,7 @@ from mouseion.support.utils import json_dumps, json_loads
 
 SCHEMA_VERSION = "1"
 EMBEDDING_DIMS = 768
+T = TypeVar("T")
 
 
 def _to_db_timestamp(value: datetime) -> str:
@@ -71,11 +72,11 @@ class SQLiteStore:
 
     async def open(self) -> None:
         self.settings.ensure_directories()
-        await anyio.to_thread.run_sync(self._open_sync)
+        await run_sync(self._open_sync)
         await self.bootstrap()
 
     async def open_readonly(self) -> None:
-        await anyio.to_thread.run_sync(self._open_sync, True)
+        await run_sync(self._open_sync, True)
 
     def _open_sync(self, readonly: bool = False) -> None:
         flags = (
@@ -107,18 +108,18 @@ class SQLiteStore:
     async def execute(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any] | None = None
     ) -> QueryResult:
-        return await anyio.to_thread.run_sync(self._execute_sync, query, parameters or ())
+        return await run_sync(self._execute_sync, query, parameters or ())
 
     def _execute_sync(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any]
     ) -> QueryResult:
         return QueryResult(_rows_from_cursor(self.connection().cursor(), query, parameters))
 
-    async def write(self, fn: Callable[[apsw.Connection], Any]) -> Any:
+    async def write(self, fn: Callable[[apsw.Connection], T]) -> T:
         async with self._write_lock:
-            return await anyio.to_thread.run_sync(self._write_sync, fn)
+            return await run_sync(self._write_sync, fn)
 
-    def _write_sync(self, fn: Callable[[apsw.Connection], Any]) -> Any:
+    def _write_sync(self, fn: Callable[[apsw.Connection], T]) -> T:
         conn = self.connection()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -324,13 +325,11 @@ class SQLiteStore:
 
         def run(conn: apsw.Connection) -> list[DocumentChunkUpsertResult]:
             now_timestamp = _to_db_timestamp(now)
-            document_ids = [document.document_id or uuid4() for document in documents]
-            existing_ids = _existing_document_ids(conn, document_ids)
             results: list[DocumentChunkUpsertResult] = []
 
-            for document_id, document in zip(document_ids, documents, strict=True):
+            for document in documents:
+                document_id, exists = _resolve_document_upsert_identity(conn, document)
                 document_id_text = str(document_id)
-                exists = document_id_text in existing_ids
                 if exists:
                     _delete_document_children(conn, [document_id_text])
 
@@ -348,7 +347,7 @@ class SQLiteStore:
 
             return results
 
-        return cast(list[DocumentChunkUpsertResult], await self.write(run))
+        return await self.write(run)
 
     async def delete_document(self, document_id: UUID) -> tuple[int, int]:
         def run(conn: apsw.Connection) -> tuple[int, int]:
@@ -400,6 +399,16 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_doc_source ON documents(source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_type_source ON documents(type, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_type_content_hash ON documents(type, content_hash)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_unique_type_source
+    ON documents(type, source)
+    WHERE type != 'memory'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_unique_memory_content_hash
+    ON documents(type, content_hash)
+    WHERE type = 'memory'
+    """,
     """
     CREATE TABLE IF NOT EXISTS tags(
       document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
@@ -484,8 +493,8 @@ def _rows_from_cursor(
         first = next(results)
     except StopIteration:
         return []
-    description: Any = cursor.getdescription() or []
-    names = [column[0] for column in description]
+    description = cursor.getdescription() or []
+    names = [str(column[0]) for column in description]
     rows = [first, *results]
     return [dict(zip(names, row, strict=False)) for row in rows]
 
@@ -508,16 +517,39 @@ def _batched[T](items: list[T], size: int) -> list[list[T]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def _existing_document_ids(conn: apsw.Connection, document_ids: list[UUID]) -> set[str]:
-    existing_ids: set[str] = set()
-    for id_batch in _batched([str(document_id) for document_id in document_ids], 900):
-        placeholders = ",".join("?" for _ in id_batch)
-        rows = conn.cursor().execute(
-            f"SELECT id FROM documents WHERE id IN ({placeholders})",
-            id_batch,
-        )
-        existing_ids.update(str(row[0]) for row in rows)
-    return existing_ids
+def _resolve_document_upsert_identity(
+    conn: apsw.Connection, document: DocumentChunkUpsert
+) -> tuple[UUID, bool]:
+    natural_row = _fetch_one(
+        conn,
+        f"""
+        SELECT id
+        FROM documents
+        WHERE type = ? AND {_ingest_identity_column(document.doc_type)} = ?
+        LIMIT 1
+        """,
+        (str(document.doc_type), _ingest_identity_value(document)),
+    )
+    if natural_row is not None:
+        return _uuid(natural_row["id"]), True
+
+    if document.document_id is None:
+        return uuid4(), False
+
+    id_row = _fetch_one(
+        conn,
+        "SELECT id FROM documents WHERE id = ? LIMIT 1",
+        (str(document.document_id),),
+    )
+    return document.document_id, id_row is not None
+
+
+def _ingest_identity_column(doc_type: DocumentType) -> str:
+    return "content_hash" if doc_type == DocumentType.MEMORY else "source"
+
+
+def _ingest_identity_value(document: DocumentChunkUpsert) -> str:
+    return document.content_hash if document.doc_type == DocumentType.MEMORY else document.source
 
 
 def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) -> None:
@@ -586,7 +618,7 @@ def _insert_document_chunks(
         chunk_id = conn.last_insert_rowid()
         conn.execute(
             "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-            (chunk_id, _embedding_blob(embedding)),
+            (chunk_id, embedding_blob(embedding)),
         )
 
 
@@ -611,7 +643,7 @@ def _document_select_sql() -> str:
     """
 
 
-def _embedding_blob(embedding: list[float] | bytes | memoryview) -> bytes:
+def embedding_blob(embedding: list[float] | bytes | memoryview) -> bytes:
     if isinstance(embedding, bytes):
         return embedding
     if isinstance(embedding, memoryview):
@@ -632,9 +664,18 @@ def _embedding_list(value: Any) -> list[float]:
 
 def document_from_row(row: dict[str, Any]) -> Document:
     data = _extract_prefixed(row, "d")
-    tags = data.get("tags") or []
-    if isinstance(tags, str):
-        tags = json.loads(tags)
+    raw_tags: object = data.get("tags")
+    if isinstance(raw_tags, str):
+        loaded_tags: object = json.loads(raw_tags)
+        tags = (
+            [str(tag) for tag in cast(list[object], loaded_tags)]
+            if isinstance(loaded_tags, list)
+            else []
+        )
+    elif isinstance(raw_tags, list):
+        tags = [str(tag) for tag in cast(list[object], raw_tags)]
+    else:
+        tags = []
     return Document(
         id=_uuid(data["id"]),
         type=DocumentType(str(data["type"])),
@@ -643,7 +684,7 @@ def document_from_row(row: dict[str, Any]) -> Document:
         content_hash=str(data["content_hash"]),
         created_at=_from_db_timestamp(data["created_at"]),
         updated_at=_from_db_timestamp(data["updated_at"]),
-        tags=list(tags),
+        tags=tags,
         metadata=json_loads(data.get("metadata")),
     )
 

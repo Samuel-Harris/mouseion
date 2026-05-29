@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -21,6 +21,7 @@ from mouseion.support.utils import canonical_text_hash
 
 EdgePolicy = Literal["skip", "incremental", "recompute-after-insert"]
 _BatchAction = Literal["created", "replaced"]
+JsonDict = dict[str, Any]
 
 
 class BatchIngestItem(BaseModel):
@@ -47,7 +48,7 @@ class BulkIngestService:
         *,
         skip_unchanged: bool = True,
         metadata_compare_exclude: set[str] | None = None,
-    ) -> dict:
+    ) -> JsonDict:
         plan = await self._plan(
             items,
             skip_unchanged=skip_unchanged,
@@ -71,7 +72,7 @@ class BulkIngestService:
         edge_policy: EdgePolicy = "incremental",
         skip_unchanged: bool = False,
         metadata_compare_exclude: set[str] | None = None,
-    ) -> dict:
+    ) -> JsonDict:
         if edge_policy not in {"skip", "incremental", "recompute-after-insert"}:
             raise ValueError(f"Unsupported edge policy: {edge_policy}")
 
@@ -139,7 +140,8 @@ class BulkIngestService:
         )
 
         writable: list[_PreparedBatchItem] = []
-        skipped_documents: list[dict] = []
+        skipped_documents: list[JsonDict] = []
+        planned_identities: set[tuple[DocumentType, str]] = set()
         for item in prepared:
             identity = _ingest_identity(item.content.type, item.source, item.content_hash)
             existing_document = existing.get((item.content.type, identity))
@@ -154,7 +156,13 @@ class BulkIngestService:
             if item.content.type == DocumentType.MEMORY and existing_document is None:
                 item.source = f"memory:{uuid4()}"
             item.document_id = existing_document.id if existing_document else None
-            item.action = "replaced" if existing_document else "created"
+            identity_key = (item.content.type, identity)
+            item.action = (
+                "replaced"
+                if existing_document is not None or identity_key in planned_identities
+                else "created"
+            )
+            planned_identities.add(identity_key)
             writable.append(item)
         return _BatchPlan(writable=writable, skipped_documents=skipped_documents)
 
@@ -206,7 +214,7 @@ class _PreparedBatchItem:
 @dataclass(slots=True)
 class _BatchPlan:
     writable: list[_PreparedBatchItem]
-    skipped_documents: list[dict]
+    skipped_documents: list[JsonDict]
 
 
 def _prepare_batch_item(item: BatchIngestItem) -> _PreparedBatchItem:
@@ -238,7 +246,7 @@ def _comparable_metadata(metadata: dict[str, object], excluded_keys: set[str]) -
     return {key: value for key, value in metadata.items() if key not in excluded_keys}
 
 
-def _skipped_document_output(item: _PreparedBatchItem, document: Document) -> dict:
+def _skipped_document_output(item: _PreparedBatchItem, document: Document) -> JsonDict:
     return {
         "document_id": str(document.id),
         "source": document.source,
@@ -248,7 +256,7 @@ def _skipped_document_output(item: _PreparedBatchItem, document: Document) -> di
     }
 
 
-def _planned_document_output(item: _PreparedBatchItem, chunks_created: int) -> dict:
+def _planned_document_output(item: _PreparedBatchItem, chunks_created: int) -> JsonDict:
     return {
         "document_id": str(item.document_id) if item.document_id else "",
         "source": item.source,
@@ -261,13 +269,13 @@ def _planned_document_output(item: _PreparedBatchItem, chunks_created: int) -> d
 def _batch_ingest_output(
     *,
     edge_policy: EdgePolicy,
-    documents: list[dict],
+    documents: list[JsonDict],
     inserted: int,
     updated: int,
     skipped: int,
     chunks_created: int,
     edges_created: int,
-) -> dict:
+) -> JsonDict:
     return {
         "status": "ok",
         "edge_policy": edge_policy,

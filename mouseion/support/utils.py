@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid5
 
 EDGE_NAMESPACE = UUID("a14746c0-0ed7-55bf-a95d-dc320fa22d08")
@@ -31,9 +31,9 @@ def json_dumps(value: Any) -> str:
 def json_loads(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
-    loaded = json.loads(value)
+    loaded: object = json.loads(value)
     if isinstance(loaded, dict):
-        return loaded
+        return cast(dict[str, Any], loaded)
     return {"value": loaded}
 
 
