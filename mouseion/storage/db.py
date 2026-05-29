@@ -75,26 +75,23 @@ class SQLiteStore:
         await run_sync(self._open_sync)
         await self.bootstrap()
 
-    async def open_readonly_if_exists(self) -> bool:
-        if not self.settings.sqlite_path.exists():
-            return False
-        await run_sync(self._open_readonly_sync)
-        return True
+    async def open_readonly(self) -> None:
+        await run_sync(self._open_sync, True)
 
-    def _open_sync(self) -> None:
-        conn = apsw.Connection(str(self.settings.sqlite_path))
+    def _open_sync(self, readonly: bool = False) -> None:
+        flags = (
+            apsw.SQLITE_OPEN_READONLY
+            if readonly
+            else apsw.SQLITE_OPEN_READWRITE | apsw.SQLITE_OPEN_CREATE
+        )
+        conn = apsw.Connection(str(self.settings.sqlite_path), flags=flags)
         conn.enableloadextension(True)
         sqlite_vec.load(conn)
         conn.enableloadextension(False)
-        conn.execute("PRAGMA journal_mode=WAL")
+        if not readonly:
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA recursive_triggers=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        self.database = conn
-
-    def _open_readonly_sync(self) -> None:
-        conn = apsw.Connection(str(self.settings.sqlite_path), flags=apsw.SQLITE_OPEN_READONLY)
-        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         self.database = conn
 
@@ -335,72 +332,10 @@ class SQLiteStore:
                 document_id_text = str(document_id)
                 if exists:
                     _delete_document_children(conn, [document_id_text])
-                    conn.execute(
-                        """
-                        UPDATE documents
-                        SET type = ?,
-                            title = ?,
-                            source = ?,
-                            content_hash = ?,
-                            updated_at = ?,
-                            metadata = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            str(document.doc_type),
-                            document.title,
-                            document.source,
-                            document.content_hash,
-                            now_timestamp,
-                            json_dumps(document.metadata),
-                            document_id_text,
-                        ),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO documents(
-                            id, type, title, source, content_hash, created_at, updated_at, metadata
-                        )
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            document_id_text,
-                            str(document.doc_type),
-                            document.title,
-                            document.source,
-                            document.content_hash,
-                            now_timestamp,
-                            now_timestamp,
-                            json_dumps(document.metadata),
-                        ),
-                    )
 
-                conn.executemany(
-                    "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
-                    [(document_id_text, tag) for tag in document.tags],
-                )
-                for chunk_index, (content, token_count, embedding) in enumerate(document.chunks):
-                    conn.execute(
-                        """
-                        INSERT INTO chunks(
-                            document_id, content, chunk_index, token_count, created_at
-                        )
-                        VALUES(?, ?, ?, ?, ?)
-                        """,
-                        (
-                            document_id_text,
-                            content,
-                            chunk_index,
-                            token_count,
-                            now_timestamp,
-                        ),
-                    )
-                    chunk_id = conn.last_insert_rowid()
-                    conn.execute(
-                        "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-                        (chunk_id, embedding_blob(embedding)),
-                    )
+                _upsert_document_row(conn, document_id_text, document, now_timestamp)
+                _insert_document_tags(conn, document_id_text, document.tags)
+                _insert_document_chunks(conn, document_id_text, document.chunks, now_timestamp)
                 results.append(
                     DocumentChunkUpsertResult(
                         document_id=document_id,
@@ -624,6 +559,67 @@ def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) ->
         placeholders = ",".join("?" for _ in document_id_batch)
         conn.execute(f"DELETE FROM chunks WHERE document_id IN ({placeholders})", document_id_batch)
         conn.execute(f"DELETE FROM tags WHERE document_id IN ({placeholders})", document_id_batch)
+
+
+def _upsert_document_row(
+    conn: apsw.Connection,
+    document_id: str,
+    document: DocumentChunkUpsert,
+    now_timestamp: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO documents(
+            id, type, title, source, content_hash, created_at, updated_at, metadata
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            type = excluded.type,
+            title = excluded.title,
+            source = excluded.source,
+            content_hash = excluded.content_hash,
+            updated_at = excluded.updated_at,
+            metadata = excluded.metadata
+        """,
+        (
+            document_id,
+            str(document.doc_type),
+            document.title,
+            document.source,
+            document.content_hash,
+            now_timestamp,
+            now_timestamp,
+            json_dumps(document.metadata),
+        ),
+    )
+
+
+def _insert_document_tags(conn: apsw.Connection, document_id: str, tags: list[str]) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
+        [(document_id, tag) for tag in tags],
+    )
+
+
+def _insert_document_chunks(
+    conn: apsw.Connection,
+    document_id: str,
+    chunks: list[tuple[str, int, list[float]]],
+    now_timestamp: str,
+) -> None:
+    for chunk_index, (content, token_count, embedding) in enumerate(chunks):
+        conn.execute(
+            """
+            INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (document_id, content, chunk_index, token_count, now_timestamp),
+        )
+        chunk_id = conn.last_insert_rowid()
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+            (chunk_id, embedding_blob(embedding)),
+        )
 
 
 def _document_select_sql() -> str:

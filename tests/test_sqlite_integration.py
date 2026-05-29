@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import UUID
 
@@ -9,7 +10,6 @@ from mouseion.config import Settings
 from mouseion.domain.models import (
     AddFileInput,
     AddMemoryInput,
-    BatchIngestItem,
     ChunkText,
     DeleteInput,
     DocumentType,
@@ -23,6 +23,7 @@ from mouseion.domain.models import (
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
+from mouseion.services.bulk_ingest import BatchIngestItem, BulkIngestService
 from mouseion.services.exporter import Exporter
 from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
@@ -43,7 +44,7 @@ class FakeEmbedder:
 
 
 @pytest.fixture
-async def mouseion_service(tmp_path: Path) -> tuple[SQLiteStore, MouseionService]:
+async def mouseion_service(tmp_path: Path) -> AsyncIterator[tuple[SQLiteStore, MouseionService]]:
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
     store = SQLiteStore(settings)
     await store.open()
@@ -180,10 +181,11 @@ async def test_batch_ingest_batches_embeddings_and_can_skip_edges(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
     embedder = service.embedder  # type: ignore[assignment]
     embedder.calls = []  # type: ignore[attr-defined]
 
-    output = await service.batch_ingest(
+    output = await bulk_ingest.ingest(
         [
             _batch_item("batch:one", "First batch document exactphrase", tags=["bulk"]),
             _batch_item("batch:two", "Second batch document otherphrase", tags=["bulk"]),
@@ -205,8 +207,15 @@ async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
 
-    output = await service.batch_ingest(
+    preview = await bulk_ingest.preview(
+        [
+            _batch_item("batch:dupe", "First duplicate batch document"),
+            _batch_item("batch:dupe", "Second duplicate batch document"),
+        ]
+    )
+    output = await bulk_ingest.ingest(
         [
             _batch_item("batch:dupe", "First duplicate batch document"),
             _batch_item("batch:dupe", "Second duplicate batch document"),
@@ -227,6 +236,8 @@ async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
         ("batch:dupe",),
     )
 
+    assert preview["inserted"] == 1
+    assert preview["updated"] == 1
     assert output["inserted"] == 1
     assert output["updated"] == 1
     assert int(documents.first()["total"]) == 1  # type: ignore[index]
@@ -237,8 +248,9 @@ async def test_batch_ingest_recomputes_edges_after_insert(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
 
-    output = await service.batch_ingest(
+    output = await bulk_ingest.ingest(
         [
             _batch_item("batch:one", "First recompute batch document"),
             _batch_item("batch:two", "Second recompute batch document"),
@@ -255,13 +267,14 @@ async def test_batch_ingest_recomputes_edges_after_insert(
 async def test_batch_ingest_skips_unchanged_documents_without_embedding(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
-    _, service = mouseion_service
+    store, service = mouseion_service
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
     item = _batch_item("batch:stable", "Stable unchanged batch document")
-    await service.batch_ingest([item], edge_policy="skip")
+    await bulk_ingest.ingest([item], edge_policy="skip")
     embedder = service.embedder  # type: ignore[assignment]
     embedder.calls = []  # type: ignore[attr-defined]
 
-    output = await service.batch_ingest([item], edge_policy="skip", skip_unchanged=True)
+    output = await bulk_ingest.ingest([item], edge_policy="skip", skip_unchanged=True)
 
     assert output["inserted"] == 0
     assert output["updated"] == 0

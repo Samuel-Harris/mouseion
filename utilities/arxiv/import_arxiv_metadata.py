@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,22 +27,18 @@ from rich.progress import (
 )
 
 from mouseion.config import Settings
-from mouseion.domain.models import (
-    BatchIngestItem,
-    ChunkText,
-    DocumentType,
-    IngestedContent,
-    normalize_tags,
-)
+from mouseion.domain.models import ChunkText, DocumentType, IngestedContent, normalize_tags
 from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.embedder import Embedder
-from mouseion.ingest.ingestor import Ingestor
-from mouseion.ingest.repo import RepoService
-from mouseion.services.exporter import Exporter
+from mouseion.services.bulk_ingest import (
+    BatchIngestItem,
+    BulkIngestService,
+    EdgePolicy,
+)
+from mouseion.services.factory import open_services
 from mouseion.services.graph import GraphService
-from mouseion.services.search import SearchService
-from mouseion.services.service import EdgePolicy, MouseionService, preview_batch_ingest
+from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
 from mouseion.support.utils import canonical_text_hash
 
@@ -263,34 +259,36 @@ async def import_arxiv_metadata(
     import_timestamp = datetime.now(tz=UTC).isoformat(timespec="seconds")
     import_source = str(options.input)
 
-    store: SQLiteStore | None = None
+    dry_store: SQLiteStore | None = None
     service: MouseionService | None = None
+    bulk_ingest: BulkIngestService | None = None
     active_embedder = embedder
     progress = create_progress() if options.progress_every > 0 else None
     scan_task: TaskID | None = None
     input_size = options.input.stat().st_size
 
-    if options.dry_run:
-        dry_store = SQLiteStore(settings)
-        if await dry_store.open_readonly_if_exists():
-            store = dry_store
-    else:
-        active_embedder = active_embedder or Embedder(settings)
-        await ensure_embedding_backend_ready(active_embedder)
-        store = SQLiteStore(settings)
-        await store.open()
-        service = MouseionService(
-            store,
-            Ingestor(settings),
-            Chunker(settings),
-            active_embedder,
-            SearchService(store, active_embedder, settings.rrf_k),
-            GraphService(store, settings),
-            RepoService(settings),
-            Exporter(settings, store),
-        )
+    async with AsyncExitStack() as stack:
+        if options.dry_run:
+            if settings.sqlite_path.exists():
+                dry_store = SQLiteStore(settings)
+                await dry_store.open_readonly()
+                stack.push_async_callback(dry_store.close)
+                dry_embedder = active_embedder or Embedder(settings)
+                bulk_ingest = BulkIngestService(
+                    dry_store,
+                    Chunker(settings),
+                    dry_embedder,
+                    GraphService(dry_store, settings),
+                )
+        else:
+            active_embedder = active_embedder or Embedder(settings)
+            await ensure_embedding_backend_ready(active_embedder)
+            services = await stack.enter_async_context(
+                open_services(settings, embedder=active_embedder)
+            )
+            service = services.service
+            bulk_ingest = services.bulk_ingest
 
-    try:
         batch: list[PreparedPaper] = []
         progress_context = progress if progress is not None else nullcontext()
         with progress_context:
@@ -355,8 +353,9 @@ async def import_arxiv_metadata(
 
                     if len(batch) >= options.batch_size:
                         await flush_batch(
+                            bulk_ingest=bulk_ingest,
                             service=service,
-                            dry_store=store if options.dry_run else None,
+                            dry_run=options.dry_run,
                             batch=batch,
                             stats=stats,
                             edge_policy=_batch_edge_policy(options.edge_policy),
@@ -374,8 +373,9 @@ async def import_arxiv_metadata(
 
             if batch:
                 await flush_batch(
+                    bulk_ingest=bulk_ingest,
                     service=service,
-                    dry_store=store if options.dry_run else None,
+                    dry_run=options.dry_run,
                     batch=batch,
                     stats=stats,
                     edge_policy=_batch_edge_policy(options.edge_policy),
@@ -401,9 +401,6 @@ async def import_arxiv_metadata(
             ):
                 recompute = await service.recompute_edges()
                 stats.edges_created = int(recompute["edges_created"])
-    finally:
-        if store is not None:
-            await store.close()
 
     stats.elapsed_seconds = time.monotonic() - start
     return stats
@@ -411,17 +408,20 @@ async def import_arxiv_metadata(
 
 async def flush_batch(
     *,
+    bulk_ingest: BulkIngestService | None,
     service: MouseionService | None,
-    dry_store: SQLiteStore | None,
+    dry_run: bool,
     batch: list[PreparedPaper],
     stats: ImportStats,
     edge_policy: EdgePolicy,
 ) -> None:
-    if service is None:
-        output = await preview_batch_ingest(
-            dry_store,
-            [paper_to_batch_item(paper) for paper in batch],
-            edge_policy=edge_policy,
+    items = [paper_to_batch_item(paper) for paper in batch]
+    if dry_run:
+        if bulk_ingest is None:
+            stats.inserted += len(batch)
+            return
+        output = await bulk_ingest.preview(
+            items,
             skip_unchanged=True,
             metadata_compare_exclude={"import_timestamp"},
         )
@@ -430,9 +430,12 @@ async def flush_batch(
         stats.skipped += int(output["skipped"])
         return
 
+    if bulk_ingest is None or service is None:
+        raise RuntimeError("import batch requires open Mouseion services")
+
     try:
-        output = await service.batch_ingest(
-            [paper_to_batch_item(paper) for paper in batch],
+        output = await bulk_ingest.ingest(
+            items,
             edge_policy=edge_policy,
             skip_unchanged=True,
             metadata_compare_exclude={"import_timestamp"},

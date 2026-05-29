@@ -27,15 +27,8 @@ from mouseion.domain.models import (
     SearchInput,
 )
 from mouseion.errors import MouseionError
-from mouseion.ingest.chunker import Chunker
-from mouseion.ingest.embedder import Embedder
-from mouseion.ingest.ingestor import Ingestor
-from mouseion.ingest.repo import RepoService
-from mouseion.services.exporter import Exporter
-from mouseion.services.graph import GraphService
-from mouseion.services.search import SearchService
+from mouseion.services.factory import open_services
 from mouseion.services.service import MouseionService
-from mouseion.storage.db import SQLiteStore
 from mouseion.support.logging_config import configure_logging, get_logger
 
 JsonDict = dict[str, Any]
@@ -47,46 +40,28 @@ def create_app() -> FastAPI:
     logger = get_logger(__name__)
     service_ref: dict[str, MouseionService] = {}
     tasks: BackgroundTasks | None = None
-    store: SQLiteStore | None = None
     mcp_app = build_mcp(service_ref).streamable_http_app()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-        nonlocal tasks, store
+        nonlocal tasks
         async with mcp_app.router.lifespan_context(mcp_app):
-            settings.ensure_directories()
             settings.warn_if_non_loopback(logger)
-            try:
-                store = SQLiteStore(settings)
-                await store.open()
-                embedder = Embedder(settings)
-                graph = GraphService(store, settings)
-                service = MouseionService(
-                    store=store,
-                    ingestor=Ingestor(settings),
-                    chunker=Chunker(settings),
-                    embedder=embedder,
-                    searcher=SearchService(store, embedder, settings.rrf_k),
-                    graph=graph,
-                    repos=RepoService(settings),
-                    exporter=Exporter(settings, store),
-                )
-                service_ref["service"] = service
-                app.state.service = service
-                tasks = BackgroundTasks(settings, graph)
+            async with open_services(settings) as services:
+                service_ref["service"] = services.service
+                app.state.service = services.service
+                tasks = BackgroundTasks(settings, services.service.graph)
                 tasks.start()
                 logger.info(
                     "mouseion_daemon_started",
                     host=settings.mouseion_host,
                     port=settings.mouseion_port,
                 )
-                yield
-            finally:
-                if tasks is not None:
+                try:
+                    yield
+                finally:
                     await tasks.stop()
-                if store is not None:
-                    await store.close()
-                logger.info("mouseion_daemon_stopped")
+                    logger.info("mouseion_daemon_stopped")
 
     app = FastAPI(title="Mouseion", lifespan=lifespan)
     app.router.routes.extend(mcp_app.routes)

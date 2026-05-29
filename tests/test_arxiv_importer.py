@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,7 @@ def arxiv_jsonl(tmp_path: Path) -> Path:
 @pytest.fixture
 async def imported_service(
     tmp_path: Path, categories_json: Path, arxiv_jsonl: Path
-) -> tuple[SQLiteStore, MouseionService, Settings]:
+) -> AsyncIterator[tuple[SQLiteStore, MouseionService, Settings]]:
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
     await import_arxiv_metadata(
         ImportOptions(
@@ -387,9 +388,11 @@ async def test_rerun_skips_unchanged_existing_document_without_duplicates(
     arxiv_jsonl: Path,
 ) -> None:
     store, _, settings = imported_service
-    first_count = (
+    first_count_row = (
         await store.execute("SELECT count(*) AS total FROM documents WHERE source LIKE 'arxiv:%'")
-    ).first()["total"]
+    ).first()
+    assert first_count_row is not None
+    first_count = first_count_row["total"]
     rerun_embedder = RecordingEmbedder()
 
     dry_run = await import_arxiv_metadata(
@@ -416,9 +419,11 @@ async def test_rerun_skips_unchanged_existing_document_without_duplicates(
         settings=settings,
         embedder=rerun_embedder,  # type: ignore[arg-type]
     )
-    second_count = (
+    second_count_row = (
         await store.execute("SELECT count(*) AS total FROM documents WHERE source LIKE 'arxiv:%'")
-    ).first()["total"]
+    ).first()
+    assert second_count_row is not None
+    second_count = second_count_row["total"]
 
     assert first_count == 2
     assert dry_run.inserted == 0
