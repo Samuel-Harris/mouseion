@@ -5,7 +5,7 @@ from typing import Any
 
 from mouseion.domain.models import SearchFilter
 from mouseion.ingest.embedder import Embedder
-from mouseion.storage.db import SQLiteStore, _embedding_blob, chunk_from_row, document_from_row
+from mouseion.storage.db import SQLiteStore, chunk_from_row, document_from_row, embedding_blob
 
 
 @dataclass(slots=True)
@@ -44,7 +44,7 @@ class SearchService:
         vec_hits = await self._vector_hits(query_vector, fusion_k, filter)
         fts_hits = await self._fts_hits(query, fusion_k, filter)
         fused = rrf_fuse([vec_hits, fts_hits], self.rrf_k)[:top_k]
-        results = []
+        results: list[dict[str, Any]] = []
         for chunk_id, score in fused:
             hydrated = await self._hydrate_chunk(chunk_id)
             if hydrated is None:
@@ -74,7 +74,7 @@ class SearchService:
             ORDER BY distance
             LIMIT ?
             """,
-            (_embedding_blob(query_vector), search_window, *sql_filter.params, limit),
+            (embedding_blob(query_vector), search_window, *sql_filter.params, limit),
         )
         return [
             RankedHit(
@@ -200,7 +200,7 @@ class SearchService:
             """,
             (chunk_id, chunk_id, chunk_id, cap),
         )
-        neighbours = []
+        neighbours: list[dict[str, Any]] = []
         for row in result.rows:
             document = document_from_row(row)
             chunk = chunk_from_row(row)

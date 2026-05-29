@@ -108,7 +108,7 @@ class Ingestor:
             return guessed or "application/octet-stream"
 
     def _read_pdf(self, path: Path) -> str:
-        chunks = []
+        chunks: list[str] = []
         with fitz.open(path) as document:
             for page in document:
                 chunks.append(page.get_text("text"))

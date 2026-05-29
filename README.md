@@ -98,6 +98,6 @@ All tools return JSON. The daemon does retrieval only; answer synthesis belongs 
 
 ```bash
 uv run ruff check .
-uv run mypy mouseion
+uv run pyright
 uv run pytest
 ```

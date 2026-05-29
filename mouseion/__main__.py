@@ -5,7 +5,7 @@ import asyncio
 import json
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +25,8 @@ OLLAMA_START_TIMEOUT_SECONDS = 20.0
 OLLAMA_POLL_SECONDS = 0.25
 NUKE_DB_CONFIRMATION = "nuke mouseion db"
 STATUS_TIMEOUT_SECONDS = 2.0
+JsonDict = dict[str, Any]
+ObjectMapping = Mapping[str, object]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,7 +77,7 @@ def main() -> None:
         _nuke_db(settings, assume_yes=args.yes)
 
 
-async def _recompute_edges(settings: Settings) -> dict[str, Any]:
+async def _recompute_edges(settings: Settings) -> JsonDict:
     daemon_url = _mouseion_base_url(settings)
     try:
         result = _mouseion_json(
@@ -102,7 +104,7 @@ async def _recompute_edges(settings: Settings) -> dict[str, Any]:
         return {"source": "local database", **result}
 
 
-def _print_recompute_edges(result: dict[str, Any]) -> None:
+def _print_recompute_edges(result: JsonDict) -> None:
     print("Mouseion edge recompute")
     print(f"Source: {result['source']}")
     print(f"Chunks processed: {int(result.get('chunks_processed', 0))}")
@@ -110,7 +112,7 @@ def _print_recompute_edges(result: dict[str, Any]) -> None:
     print(f"Duration seconds: {float(result.get('duration_seconds', 0.0)):.3f}")
 
 
-def _collect_status(settings: Settings) -> dict[str, Any]:
+def _collect_status(settings: Settings) -> JsonDict:
     daemon_url = _mouseion_base_url(settings)
     try:
         stats = _mouseion_json(daemon_url, "api/stats", timeout=STATUS_TIMEOUT_SECONDS)
@@ -132,16 +134,17 @@ def _collect_status(settings: Settings) -> dict[str, Any]:
         }
 
 
-def _print_status(status: dict[str, Any]) -> None:
-    stats = status["stats"]
-    edges = stats["edges"]
+def _print_status(status: JsonDict) -> None:
+    stats = cast(ObjectMapping, status["stats"])
+    edges = cast(ObjectMapping, stats["edges"])
     print("Mouseion status")
     print(f"Running: {'yes' if status['running'] else 'no'}")
     print(f"Daemon: {status['daemon_url']}")
     print(f"Database: {status['database']}")
     print(f"Stats source: {status['stats_source']}")
     print(f"Documents: {stats['documents']}")
-    for doc_type, total in stats["documents_by_type"].items():
+    documents_by_type = cast(ObjectMapping, stats["documents_by_type"])
+    for doc_type, total in documents_by_type.items():
         print(f"  {doc_type}: {total}")
     print(f"Chunks: {stats['chunks']}")
     print(f"Edges: {edges['total']}")
@@ -165,7 +168,7 @@ def _mouseion_json(
         return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
 
 
-def _local_database_stats(settings: Settings) -> dict[str, Any]:
+def _local_database_stats(settings: Settings) -> JsonDict:
     if not settings.sqlite_path.exists():
         return {"source": "local database (not found)", "stats": _empty_stats()}
     try:
@@ -178,7 +181,7 @@ def _local_database_stats(settings: Settings) -> dict[str, Any]:
         return {"source": "local database (unreadable)", "stats": _empty_stats()}
 
 
-def _stats_from_connection(conn: apsw.Connection) -> dict[str, Any]:
+def _stats_from_connection(conn: apsw.Connection) -> JsonDict:
     document_types: dict[str, int] = {}
     if _table_exists(conn, "documents"):
         for doc_type, total in conn.execute(
@@ -219,7 +222,7 @@ def _table_exists(conn: apsw.Connection, table: str) -> bool:
     return row is not None
 
 
-def _empty_stats() -> dict[str, Any]:
+def _empty_stats() -> JsonDict:
     return {
         "documents": 0,
         "chunks": 0,
@@ -229,25 +232,33 @@ def _empty_stats() -> dict[str, Any]:
     }
 
 
-def _normalize_stats(stats: dict[str, Any]) -> dict[str, Any]:
+def _normalize_stats(stats: ObjectMapping) -> JsonDict:
     normalized = _empty_stats()
-    normalized["documents"] = int(stats.get("documents", 0))
-    normalized["chunks"] = int(stats.get("chunks", 0))
-    normalized["tags"] = int(stats.get("tags", 0))
+    normalized["documents"] = _int_value(stats.get("documents"), 0)
+    normalized["chunks"] = _int_value(stats.get("chunks"), 0)
+    normalized["tags"] = _int_value(stats.get("tags"), 0)
 
     edges = stats.get("edges")
-    if isinstance(edges, dict):
-        related = int(edges.get("related", 0))
-        similar = int(edges.get("similar", 0))
-        total = int(edges.get("total", related + similar))
+    if isinstance(edges, Mapping):
+        edge_values = cast(ObjectMapping, edges)
+        related = _int_value(edge_values.get("related"), 0)
+        similar = _int_value(edge_values.get("similar"), 0)
+        total = _int_value(edge_values.get("total"), related + similar)
         normalized["edges"] = {"total": total, "related": related, "similar": similar}
 
     documents_by_type = stats.get("documents_by_type")
-    if isinstance(documents_by_type, dict):
+    if isinstance(documents_by_type, Mapping):
+        document_type_values = cast(ObjectMapping, documents_by_type)
         normalized["documents_by_type"] = {
-            str(doc_type): int(total) for doc_type, total in documents_by_type.items()
+            str(doc_type): _int_value(total, 0) for doc_type, total in document_type_values.items()
         }
     return normalized
+
+
+def _int_value(value: object, default: int) -> int:
+    if isinstance(value, int | float | str):
+        return int(value)
+    return default
 
 
 def _nuke_db(settings: Settings, *, assume_yes: bool = False) -> list[Path]:
@@ -290,7 +301,7 @@ def _database_paths(settings: Settings) -> list[Path]:
 
 
 @contextmanager
-def _managed_ollama(settings: Settings, *, enabled: bool) -> Iterator[None]:
+def _managed_ollama(settings: Settings, *, enabled: bool) -> Generator[None]:
     if not enabled:
         yield
         return
@@ -313,7 +324,7 @@ def _managed_ollama(settings: Settings, *, enabled: bool) -> Iterator[None]:
                 process.wait()
 
 
-def _wait_for_ollama(host: str, process: subprocess.Popen) -> None:
+def _wait_for_ollama(host: str, process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + OLLAMA_START_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -344,10 +355,11 @@ def _ollama_model_available(host: str, model: str) -> bool:
     models = payload.get("models", [])
     if not isinstance(models, list):
         return False
-    for item in models:
-        if not isinstance(item, dict):
+    for item in cast(list[object], models):
+        if not isinstance(item, Mapping):
             continue
-        name = item.get("name") or item.get("model")
+        model_info = cast(ObjectMapping, item)
+        name = model_info.get("name") or model_info.get("model")
         if isinstance(name, str) and _model_names_match(name, model):
             return True
     return False
@@ -365,7 +377,7 @@ def _ollama_json(
     host: str, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 10
 ) -> dict[str, Any]:
     data = None
-    headers = {}
+    headers: dict[str, str] = {}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"

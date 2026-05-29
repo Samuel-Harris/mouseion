@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import apsw
@@ -35,6 +35,7 @@ from mouseion.storage.db import DocumentChunkUpsert, SQLiteStore, document_from_
 from mouseion.support.utils import canonical_text_hash, deterministic_edge_id
 
 EdgePolicy = Literal["skip", "incremental", "recompute-after-insert"]
+JsonDict = dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -59,15 +60,15 @@ class MouseionService:
     repos: RepoService
     exporter: Exporter
 
-    async def add_url(self, input: AddUrlInput) -> dict:
+    async def add_url(self, input: AddUrlInput) -> JsonDict:
         content = await self.ingestor.fetch_url(str(input.url))
         return await self._ingest(content, input.tags)
 
-    async def add_file(self, input: AddFileInput) -> dict:
+    async def add_file(self, input: AddFileInput) -> JsonDict:
         content = await self.ingestor.read_file(input.file_path)
         return await self._ingest(content, input.tags)
 
-    async def add_memory(self, input: AddMemoryInput) -> dict:
+    async def add_memory(self, input: AddMemoryInput) -> JsonDict:
         content = self.ingestor.memory(input.content)
         output = await self._ingest(content, input.tags)
         return {
@@ -78,10 +79,10 @@ class MouseionService:
             "action": output["action"],
         }
 
-    async def add_repo(self, input: AddRepoInput) -> dict:
+    async def add_repo(self, input: AddRepoInput) -> JsonDict:
         return await self.repos.add_repo(input.repo_url, input.name)
 
-    async def search(self, input: SearchInput) -> dict:
+    async def search(self, input: SearchInput) -> JsonDict:
         return await self.searcher.search(
             input.query,
             top_k=input.top_k,
@@ -89,7 +90,7 @@ class MouseionService:
             filter=input.filter,
         )
 
-    async def get_document(self, input: GetDocumentInput) -> dict:
+    async def get_document(self, input: GetDocumentInput) -> JsonDict:
         document = await self.store.get_document(input.document_id)
         if document is None:
             raise DocumentNotFoundError(f"Document not found: {input.document_id}")
@@ -101,11 +102,11 @@ class MouseionService:
             "related_documents": related,
         }
 
-    async def list_documents(self, input: ListInput) -> dict:
+    async def list_documents(self, input: ListInput) -> JsonDict:
         items, total = await self.store.list_documents(input.type, input.limit, input.offset)
         return {"items": [item.model_dump(mode="json") for item in items], "total": total}
 
-    async def relate(self, input: RelateInput) -> dict:
+    async def relate(self, input: RelateInput) -> JsonDict:
         edge_id = deterministic_edge_id(input.from_id, input.to_id, input.label)
 
         def run(conn: apsw.Connection) -> None:
@@ -126,7 +127,7 @@ class MouseionService:
         await self.store.write(run)
         return {"edge_id": str(edge_id), "status": "ok"}
 
-    async def delete(self, input: DeleteInput) -> dict:
+    async def delete(self, input: DeleteInput) -> JsonDict:
         deleted_chunks, deleted_edges = await self.store.delete_document(input.id)
         return {
             "deleted_chunks": deleted_chunks,
@@ -134,13 +135,13 @@ class MouseionService:
             "status": "deleted",
         }
 
-    async def recompute_edges(self) -> dict:
+    async def recompute_edges(self) -> JsonDict:
         return await self.graph.recompute_all()
 
-    async def export(self) -> dict:
+    async def export(self) -> JsonDict:
         return await self.exporter.export()
 
-    async def stats(self) -> dict:
+    async def stats(self) -> JsonDict:
         counts = await self._table_counts(
             {
                 "documents": "documents",
@@ -182,7 +183,7 @@ class MouseionService:
             counts[key] = int(row["total"] if row else 0)
         return counts
 
-    async def _ingest(self, content: IngestedContent, tags: list[str]) -> dict:
+    async def _ingest(self, content: IngestedContent, tags: list[str]) -> JsonDict:
         output = await self.batch_ingest(
             [BatchIngestItem(content=content, tags=tags)],
             edge_policy="incremental",
@@ -204,7 +205,7 @@ class MouseionService:
         edge_policy: EdgePolicy = "incremental",
         skip_unchanged: bool = False,
         metadata_compare_exclude: set[str] | None = None,
-    ) -> dict:
+    ) -> JsonDict:
         if not items:
             return _empty_batch_ingest_output(edge_policy)
         if edge_policy not in {"skip", "incremental", "recompute-after-insert"}:
@@ -215,8 +216,8 @@ class MouseionService:
             [(item.content.type, item.source, item.content_hash) for item in prepared]
         )
 
-        writable = []
-        skipped_documents = []
+        writable: list[_PreparedBatchItem] = []
+        skipped_documents: list[JsonDict] = []
         for item in prepared:
             identity = _ingest_identity(item.content.type, item.source, item.content_hash)
             existing_document = existing.get((item.content.type, identity))
@@ -281,7 +282,7 @@ class MouseionService:
             )
 
         upsert_results = await self.store.upsert_documents_with_chunks(upserts)
-        document_outputs = [
+        document_outputs: list[JsonDict] = [
             {
                 "document_id": str(result.document_id),
                 "source": result.source,
@@ -314,7 +315,7 @@ class MouseionService:
             edges_created=edges_created,
         )
 
-    async def _related_documents(self, document_id: UUID) -> list[dict]:
+    async def _related_documents(self, document_id: UUID) -> list[JsonDict]:
         result = await self.store.execute(
             """
             SELECT d.id,
@@ -343,7 +344,7 @@ class MouseionService:
             """,
             (str(document_id), str(document_id), str(document_id)),
         )
-        related = []
+        related: list[JsonDict] = []
         for row in result.rows:
             document = document_from_row(row)
             related.append(
@@ -357,7 +358,7 @@ class MouseionService:
         return related
 
 
-def _empty_batch_ingest_output(edge_policy: EdgePolicy) -> dict:
+def _empty_batch_ingest_output(edge_policy: EdgePolicy) -> JsonDict:
     return _batch_ingest_output(
         edge_policy=edge_policy,
         documents=[],
@@ -372,13 +373,13 @@ def _empty_batch_ingest_output(edge_policy: EdgePolicy) -> dict:
 def _batch_ingest_output(
     *,
     edge_policy: EdgePolicy,
-    documents: list[dict],
+    documents: list[JsonDict],
     inserted: int,
     updated: int,
     skipped: int,
     chunks_created: int,
     edges_created: int,
-) -> dict:
+) -> JsonDict:
     return {
         "status": "ok",
         "edge_policy": edge_policy,

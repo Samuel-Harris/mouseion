@@ -6,12 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from struct import pack, unpack
-from typing import Any
+from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
 
-import anyio
 import apsw
 import sqlite_vec
+from anyio.to_thread import run_sync
 
 from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
@@ -19,6 +19,7 @@ from mouseion.support.utils import json_dumps, json_loads
 
 SCHEMA_VERSION = "1"
 EMBEDDING_DIMS = 768
+T = TypeVar("T")
 
 
 def _to_db_timestamp(value: datetime) -> str:
@@ -71,7 +72,7 @@ class SQLiteStore:
 
     async def open(self) -> None:
         self.settings.ensure_directories()
-        await anyio.to_thread.run_sync(self._open_sync)
+        await run_sync(self._open_sync)
         await self.bootstrap()
 
     def _open_sync(self) -> None:
@@ -98,18 +99,18 @@ class SQLiteStore:
     async def execute(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any] | None = None
     ) -> QueryResult:
-        return await anyio.to_thread.run_sync(self._execute_sync, query, parameters or ())
+        return await run_sync(self._execute_sync, query, parameters or ())
 
     def _execute_sync(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any]
     ) -> QueryResult:
         return QueryResult(_rows_from_cursor(self.connection().cursor(), query, parameters))
 
-    async def write(self, fn: Callable[[apsw.Connection], Any]) -> Any:
+    async def write(self, fn: Callable[[apsw.Connection], T]) -> T:
         async with self._write_lock:
-            return await anyio.to_thread.run_sync(self._write_sync, fn)
+            return await run_sync(self._write_sync, fn)
 
-    def _write_sync(self, fn: Callable[[apsw.Connection], Any]) -> Any:
+    def _write_sync(self, fn: Callable[[apsw.Connection], T]) -> T:
         conn = self.connection()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -366,7 +367,7 @@ class SQLiteStore:
                             now_timestamp,
                         )
                     )
-                    vector_rows.append((next_chunk_id, _embedding_blob(embedding)))
+                    vector_rows.append((next_chunk_id, embedding_blob(embedding)))
                 results.append(
                     DocumentChunkUpsertResult(
                         document_id=document_id,
@@ -546,8 +547,8 @@ def _rows_from_cursor(
         first = next(results)
     except StopIteration:
         return []
-    description: Any = cursor.getdescription() or []
-    names = [column[0] for column in description]
+    description = cursor.getdescription() or []
+    names = [str(column[0]) for column in description]
     rows = [first, *results]
     return [dict(zip(names, row, strict=False)) for row in rows]
 
@@ -600,7 +601,7 @@ def _document_select_sql() -> str:
     """
 
 
-def _embedding_blob(embedding: list[float] | bytes | memoryview) -> bytes:
+def embedding_blob(embedding: list[float] | bytes | memoryview) -> bytes:
     if isinstance(embedding, bytes):
         return embedding
     if isinstance(embedding, memoryview):
@@ -621,9 +622,18 @@ def _embedding_list(value: Any) -> list[float]:
 
 def document_from_row(row: dict[str, Any]) -> Document:
     data = _extract_prefixed(row, "d")
-    tags = data.get("tags") or []
-    if isinstance(tags, str):
-        tags = json.loads(tags)
+    raw_tags: object = data.get("tags")
+    if isinstance(raw_tags, str):
+        loaded_tags: object = json.loads(raw_tags)
+        tags = (
+            [str(tag) for tag in cast(list[object], loaded_tags)]
+            if isinstance(loaded_tags, list)
+            else []
+        )
+    elif isinstance(raw_tags, list):
+        tags = [str(tag) for tag in cast(list[object], raw_tags)]
+    else:
+        tags = []
     return Document(
         id=_uuid(data["id"]),
         type=DocumentType(str(data["type"])),
@@ -632,7 +642,7 @@ def document_from_row(row: dict[str, Any]) -> Document:
         content_hash=str(data["content_hash"]),
         created_at=_from_db_timestamp(data["created_at"]),
         updated_at=_from_db_timestamp(data["updated_at"]),
-        tags=list(tags),
+        tags=tags,
         metadata=json_loads(data.get("metadata")),
     )
 

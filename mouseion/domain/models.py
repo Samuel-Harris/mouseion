@@ -27,12 +27,16 @@ class Document(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def _empty_embedding() -> list[float]:
+    return []
+
+
 class Chunk(BaseModel):
     id: int
     document_id: UUID
     content: str
     chunk_index: int
-    embedding: list[float] = Field(default_factory=list)
+    embedding: list[float] = Field(default_factory=_empty_embedding)
     token_count: int
     created_at: datetime
 
