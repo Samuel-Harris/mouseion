@@ -26,6 +26,15 @@ class FakeEmbedder:
         return [[0.0] * 767 + [1.0] for _ in texts]
 
 
+class RecordingEmbedder(FakeEmbedder):
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        return await super().embed_many(texts)
+
+
 @pytest.fixture
 def categories_json(tmp_path: Path) -> Path:
     path = tmp_path / "categories.json"
@@ -151,6 +160,8 @@ async def test_dry_run_reports_counts_without_document_writes(
 ) -> None:
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
 
+    rerun_embedder = RecordingEmbedder()
+    rerun_embedder = RecordingEmbedder()
     stats = await import_arxiv_metadata(
         ImportOptions(
             input=arxiv_jsonl,
@@ -160,7 +171,7 @@ async def test_dry_run_reports_counts_without_document_writes(
             progress_every=0,
         ),
         settings=settings,
-        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        embedder=rerun_embedder,  # type: ignore[arg-type]
     )
 
     assert stats.selected == 2
@@ -226,7 +237,53 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     assert "zeta planning" in chunks.first()["content"]  # type: ignore[index]
 
 
-async def test_rerun_replaces_existing_document_without_duplicates(
+async def test_metadata_importer_recomputes_edges_by_default(
+    imported_service: tuple[SQLiteStore, MouseionService, Settings],
+) -> None:
+    store, _, _ = imported_service
+
+    similar_edges = await store.execute("SELECT count(*) AS total FROM similar_to")
+
+    assert int(similar_edges.first()["total"]) == 1  # type: ignore[index]
+
+
+async def test_import_batches_embeddings_and_writes_one_chunk_per_paper(
+    tmp_path: Path, categories_json: Path, arxiv_jsonl: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    embedder = RecordingEmbedder()
+
+    await import_arxiv_metadata(
+        ImportOptions(
+            input=arxiv_jsonl,
+            categories_json=categories_json,
+            groups=("computer-science",),
+            limit=2,
+            batch_size=2,
+            progress_every=0,
+        ),
+        settings=settings,
+        embedder=embedder,  # type: ignore[arg-type]
+    )
+
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        chunks = await store.execute("SELECT count(*) AS total FROM chunks")
+    finally:
+        await store.close()
+
+    assert embedder.calls == [
+        [
+            "Neural Symbolic Planning\n\n"
+            "This paper contains a deliberately unique phrase about zeta planning.",
+            "Sparse Graphs\n\nA sparse graph abstract with another unique term.",
+        ]
+    ]
+    assert chunks.first()["total"] == 2  # type: ignore[index]
+
+
+async def test_rerun_skips_unchanged_existing_document_without_duplicates(
     imported_service: tuple[SQLiteStore, MouseionService, Settings],
     categories_json: Path,
     arxiv_jsonl: Path,
@@ -235,6 +292,7 @@ async def test_rerun_replaces_existing_document_without_duplicates(
     first_count = (
         await store.execute("SELECT count(*) AS total FROM documents WHERE source LIKE 'arxiv:%'")
     ).first()["total"]
+    rerun_embedder = RecordingEmbedder()
 
     dry_run = await import_arxiv_metadata(
         ImportOptions(
@@ -246,7 +304,7 @@ async def test_rerun_replaces_existing_document_without_duplicates(
             progress_every=0,
         ),
         settings=settings,
-        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        embedder=rerun_embedder,  # type: ignore[arg-type]
     )
     stats = await import_arxiv_metadata(
         ImportOptions(
@@ -258,7 +316,7 @@ async def test_rerun_replaces_existing_document_without_duplicates(
             progress_every=0,
         ),
         settings=settings,
-        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        embedder=rerun_embedder,  # type: ignore[arg-type]
     )
     second_count = (
         await store.execute("SELECT count(*) AS total FROM documents WHERE source LIKE 'arxiv:%'")
@@ -266,10 +324,66 @@ async def test_rerun_replaces_existing_document_without_duplicates(
 
     assert first_count == 2
     assert dry_run.inserted == 0
-    assert dry_run.updated == 2
+    assert dry_run.updated == 0
+    assert dry_run.skipped == 2
     assert second_count == 2
     assert stats.inserted == 0
-    assert stats.updated == 2
+    assert stats.updated == 0
+    assert stats.skipped == 2
+    assert rerun_embedder.calls == []
+
+
+async def test_rerun_updates_changed_existing_document(
+    imported_service: tuple[SQLiteStore, MouseionService, Settings],
+    categories_json: Path,
+    arxiv_jsonl: Path,
+) -> None:
+    store, _, settings = imported_service
+    arxiv_jsonl.write_text(
+        json.dumps(
+            {
+                "id": "1234.0001",
+                "submitter": "Ada Lovelace",
+                "authors": "Ada Lovelace and Grace Hopper",
+                "title": "Neural Symbolic Planning",
+                "categories": "cs.AI stat.ML",
+                "abstract": "A changed abstract with a fresh update phrase.",
+                "versions": [{"version": "v2", "created": "Sat, 2 May 2026 00:00:00 GMT"}],
+                "update_date": "2026-05-02",
+                "authors_parsed": [["Lovelace", "Ada", ""], ["Hopper", "Grace", ""]],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rerun_embedder = RecordingEmbedder()
+
+    stats = await import_arxiv_metadata(
+        ImportOptions(
+            input=arxiv_jsonl,
+            categories_json=categories_json,
+            groups=("computer-science",),
+            batch_size=10,
+            progress_every=0,
+        ),
+        settings=settings,
+        embedder=rerun_embedder,  # type: ignore[arg-type]
+    )
+    updated_chunk = await store.execute(
+        """
+        SELECT c.content
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE d.source = ?
+        """,
+        ("arxiv:1234.0001",),
+    )
+
+    assert stats.inserted == 0
+    assert stats.updated == 1
+    assert stats.skipped == 0
+    assert len(rerun_embedder.calls) == 1
+    assert "fresh update phrase" in updated_chunk.first()["content"]  # type: ignore[index]
 
 
 async def test_group_and_category_filters_use_union_semantics(

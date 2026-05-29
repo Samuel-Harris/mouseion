@@ -132,6 +132,17 @@ class ChunkText(BaseModel):
     token_count: int
 
 
+class BatchIngestItem(BaseModel):
+    content: IngestedContent
+    tags: list[str] = Field(default_factory=list)
+    chunks: list[ChunkText] | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_batch_tags(cls, value: list[str]) -> list[str]:
+        return normalize_tags(value)
+
+
 def normalize_tags(tags: list[str]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()

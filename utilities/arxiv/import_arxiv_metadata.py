@@ -1,3 +1,5 @@
+"""Import Kaggle arXiv metadata JSONL records as searchable Mouseion documents."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +14,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import apsw
 from rich.console import Console
@@ -27,11 +28,23 @@ from rich.progress import (
 )
 
 from mouseion.config import Settings
-from mouseion.domain.models import DocumentType, normalize_tags
+from mouseion.domain.models import (
+    BatchIngestItem,
+    ChunkText,
+    DocumentType,
+    IngestedContent,
+    normalize_tags,
+)
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.embedder import Embedder
-from mouseion.storage.db import SQLiteStore, _embedding_blob, _fetch_one, _to_db_timestamp
-from mouseion.support.utils import canonical_text_hash, json_dumps
+from mouseion.ingest.ingestor import Ingestor
+from mouseion.ingest.repo import RepoService
+from mouseion.services.exporter import Exporter
+from mouseion.services.graph import GraphService
+from mouseion.services.search import SearchService
+from mouseion.services.service import EdgePolicy, MouseionService
+from mouseion.storage.db import SQLiteStore, _fetch_one
+from mouseion.support.utils import canonical_text_hash, json_loads
 
 DEFAULT_INPUT = Path("raw_data/raw-kaggle-arxiv-metadata-2026-05-29.json")
 DEFAULT_CATEGORIES_JSON = Path("utilities/arxiv/categories.json")
@@ -88,6 +101,7 @@ class ImportOptions:
     batch_size: int = 100
     dry_run: bool = False
     progress_every: int = 1000
+    edge_policy: EdgePolicy = "recompute-after-insert"
 
 
 @dataclass(slots=True)
@@ -103,6 +117,15 @@ class PreparedPaper:
     unresolved_categories: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class ExistingDocumentSnapshot:
+    id: str
+    source: str
+    content_hash: str
+    tags: list[str]
+    metadata: dict[str, Any]
+
+
 @dataclass(slots=True)
 class ImportStats:
     selected: int = 0
@@ -110,6 +133,7 @@ class ImportStats:
     updated: int = 0
     skipped: int = 0
     failed: int = 0
+    edges_created: int = 0
     unresolved_categories: Counter[str] = field(default_factory=Counter)
     elapsed_seconds: float = 0.0
 
@@ -120,6 +144,7 @@ class ImportStats:
             "updated": self.updated,
             "skipped": self.skipped,
             "failed": self.failed,
+            "edges_created": self.edges_created,
             "unresolved_categories": dict(sorted(self.unresolved_categories.items())),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
         }
@@ -140,6 +165,27 @@ class DryRunDocumentLookup:
             (str(DocumentType.DOCUMENT), source),
         )
         return row is not None
+
+    def existing_sources(self, sources: list[str]) -> set[str]:
+        if self.connection is None or not sources:
+            return set()
+        return set(self.existing_snapshots(sources))
+
+    def existing_snapshots(self, sources: list[str]) -> dict[str, ExistingDocumentSnapshot]:
+        if self.connection is None or not sources:
+            return {}
+        snapshots: dict[str, ExistingDocumentSnapshot] = {}
+        for source_batch in batched(sources, 900):
+            placeholders = ",".join("?" for _ in source_batch)
+            rows = self.connection.cursor().execute(
+                f"""
+                {_existing_snapshot_select_sql()}
+                WHERE d.type = ? AND d.source IN ({placeholders})
+                """,
+                (str(DocumentType.DOCUMENT), *source_batch),
+            )
+            snapshots.update(snapshot_from_row(row) for row in rows)
+        return snapshots
 
     def close(self) -> None:
         if self.connection is not None:
@@ -196,8 +242,14 @@ def prepare_record(
 
     raw_categories = normalize_text(str(record.get("categories") or ""))
     category_codes = raw_categories.split()
-    resolved = [entry for code in category_codes if (entry := catalog.resolve(code)) is not None]
-    unresolved = [code for code in category_codes if catalog.resolve(code) is None]
+    resolved: list[CategoryEntry] = []
+    unresolved: list[str] = []
+    for code in category_codes:
+        entry = catalog.resolve(code)
+        if entry is None:
+            unresolved.append(code)
+        else:
+            resolved.append(entry)
 
     tags = ["arxiv"]
     tags.extend(f"arxiv:category:{code.lower()}" for code in category_codes)
@@ -261,12 +313,11 @@ async def import_arxiv_metadata(
     import_source = str(options.input)
 
     store: SQLiteStore | None = None
+    service: MouseionService | None = None
     dry_lookup: DryRunDocumentLookup | None = None
-    chunker: Chunker | None = None
     active_embedder = embedder
     progress = create_progress() if options.progress_every > 0 else None
     scan_task: TaskID | None = None
-    selected_task: TaskID | None = None
     input_size = options.input.stat().st_size
 
     if options.dry_run:
@@ -274,8 +325,17 @@ async def import_arxiv_metadata(
     else:
         store = SQLiteStore(settings)
         await store.open()
-        chunker = Chunker(settings)
         active_embedder = active_embedder or Embedder(settings)
+        service = MouseionService(
+            store,
+            Ingestor(settings),
+            Chunker(settings),
+            active_embedder,
+            SearchService(store, active_embedder, settings.rrf_k),
+            GraphService(store, settings),
+            RepoService(settings),
+            Exporter(settings, store),
+        )
 
     try:
         batch: list[PreparedPaper] = []
@@ -296,7 +356,6 @@ async def import_arxiv_metadata(
                         update_progress(
                             progress,
                             scan_task,
-                            selected_task,
                             pending_bytes=pending_bytes,
                             stats=stats,
                         )
@@ -338,36 +397,39 @@ async def import_arxiv_metadata(
 
                     stats.selected += 1
                     stats.unresolved_categories.update(paper.unresolved_categories)
+                    batch.append(paper)
 
-                    if options.dry_run:
-                        if dry_lookup is not None and dry_lookup.exists(paper.source):
-                            stats.updated += 1
-                        else:
-                            stats.inserted += 1
-                    else:
-                        batch.append(paper)
-                        if len(batch) >= options.batch_size:
-                            await flush_batch(store, chunker, active_embedder, batch, stats)
-                            batch = []
-
-                    update_progress(
-                        progress,
-                        scan_task,
-                        selected_task,
-                        pending_bytes=pending_bytes,
-                        stats=stats,
-                    )
-                    pending_bytes = 0
+                    if len(batch) >= options.batch_size:
+                        await flush_batch(
+                            service=service,
+                            dry_lookup=dry_lookup,
+                            batch=batch,
+                            stats=stats,
+                            edge_policy=_batch_edge_policy(options.edge_policy),
+                        )
+                        batch = []
+                        update_progress(
+                            progress,
+                            scan_task,
+                            pending_bytes=pending_bytes,
+                            stats=stats,
+                        )
+                        pending_bytes = 0
                     if options.limit is not None and stats.selected >= options.limit:
                         break
 
             if batch:
-                await flush_batch(store, chunker, active_embedder, batch, stats)
+                await flush_batch(
+                    service=service,
+                    dry_lookup=dry_lookup,
+                    batch=batch,
+                    stats=stats,
+                    edge_policy=_batch_edge_policy(options.edge_policy),
+                )
             if pending_bytes:
                 update_progress(
                     progress,
                     scan_task,
-                    selected_task,
                     pending_bytes=pending_bytes,
                     stats=stats,
                 )
@@ -375,10 +437,16 @@ async def import_arxiv_metadata(
                 update_progress(
                     progress,
                     scan_task,
-                    selected_task,
                     pending_bytes=0,
                     stats=stats,
                 )
+            if (
+                service is not None
+                and options.edge_policy == "recompute-after-insert"
+                and stats.inserted + stats.updated > 0
+            ):
+                recompute = await service.recompute_edges()
+                stats.edges_created = int(recompute["edges_created"])
     finally:
         if store is not None:
             await store.close()
@@ -390,127 +458,113 @@ async def import_arxiv_metadata(
 
 
 async def flush_batch(
-    store: SQLiteStore | None,
-    chunker: Chunker | None,
-    embedder: Embedder | None,
+    *,
+    service: MouseionService | None,
+    dry_lookup: DryRunDocumentLookup | None,
     batch: list[PreparedPaper],
     stats: ImportStats,
+    edge_policy: EdgePolicy,
 ) -> None:
-    if store is None or chunker is None or embedder is None:
-        raise RuntimeError("import batch requires an open store, chunker, and embedder")
+    if dry_lookup is not None:
+        existing = dry_lookup.existing_snapshots([paper.source for paper in batch])
+        for paper in batch:
+            snapshot = existing.get(paper.source)
+            if snapshot is None:
+                stats.inserted += 1
+            elif paper_matches_snapshot(paper, snapshot):
+                stats.skipped += 1
+            else:
+                stats.updated += 1
+        return
+
+    if service is None:
+        raise RuntimeError("import batch requires an open Mouseion service")
 
     try:
-        chunk_rows_by_paper = [chunker.chunk(paper.content) for paper in batch]
-        flat_chunk_texts = [chunk.content for chunks in chunk_rows_by_paper for chunk in chunks]
-        embeddings = await embedder.embed_many(flat_chunk_texts)
-        embedded_batches: list[list[tuple[str, int, list[float]]]] = []
-        offset = 0
-        for chunks in chunk_rows_by_paper:
-            count = len(chunks)
-            chunk_embeddings = embeddings[offset : offset + count]
-            offset += count
-            embedded_batches.append(
-                [
-                    (chunk.content, chunk.token_count, embedding)
-                    for chunk, embedding in zip(chunks, chunk_embeddings, strict=True)
-                ]
-            )
-        inserted, updated = await bulk_upsert(store, batch, embedded_batches)
-        stats.inserted += inserted
-        stats.updated += updated
+        output = await service.batch_ingest(
+            [paper_to_batch_item(paper) for paper in batch],
+            edge_policy=edge_policy,
+            skip_unchanged=True,
+            metadata_compare_exclude={"import_timestamp"},
+        )
+        stats.inserted += int(output["inserted"])
+        stats.updated += int(output["updated"])
+        stats.skipped += int(output["skipped"])
+        stats.edges_created += int(output["edges_created"])
     except Exception as exc:  # noqa: BLE001
         stats.failed += len(batch)
         print(f"failed to import batch of {len(batch)} papers: {exc}", file=sys.stderr)
 
 
-async def bulk_upsert(
-    store: SQLiteStore,
-    papers: list[PreparedPaper],
-    chunk_batches: list[list[tuple[str, int, list[float]]]],
-) -> tuple[int, int]:
-    now = datetime.now(tz=UTC)
+def batched[T](items: list[T], size: int) -> list[list[T]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
 
-    def run(conn: apsw.Connection) -> tuple[int, int]:
-        inserted = 0
-        updated = 0
-        for paper, chunks in zip(papers, chunk_batches, strict=True):
-            existing = _fetch_one(
-                conn,
-                "SELECT id FROM documents WHERE type = ? AND source = ? LIMIT 1",
-                (str(DocumentType.DOCUMENT), paper.source),
-            )
-            if existing is None:
-                document_id = str(uuid4())
-                inserted += 1
-                conn.execute(
-                    """
-                    INSERT INTO documents(
-                        id, type, title, source, content_hash, created_at, updated_at, metadata
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        document_id,
-                        str(DocumentType.DOCUMENT),
-                        paper.title,
-                        paper.source,
-                        paper.content_hash,
-                        _to_db_timestamp(now),
-                        _to_db_timestamp(now),
-                        json_dumps(paper.metadata),
-                    ),
-                )
-            else:
-                document_id = str(existing["id"])
-                updated += 1
-                conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
-                conn.execute("DELETE FROM tags WHERE document_id = ?", (document_id,))
-                conn.execute(
-                    """
-                    UPDATE documents
-                    SET type = ?,
-                        title = ?,
-                        source = ?,
-                        content_hash = ?,
-                        updated_at = ?,
-                        metadata = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        str(DocumentType.DOCUMENT),
-                        paper.title,
-                        paper.source,
-                        paper.content_hash,
-                        _to_db_timestamp(now),
-                        json_dumps(paper.metadata),
-                        document_id,
-                    ),
-                )
 
-            for tag in paper.tags:
-                conn.execute(
-                    "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
-                    (document_id, tag),
-                )
+def estimate_token_count(text: str) -> int:
+    return max(1, len(text.split()))
 
-            for chunk_index, (content, token_count, embedding) in enumerate(chunks):
-                conn.execute(
-                    """
-                    INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (document_id, content, chunk_index, token_count, _to_db_timestamp(now)),
-                )
-                chunk_id = conn.last_insert_rowid()
-                conn.execute(
-                    "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-                    (chunk_id, _embedding_blob(embedding)),
-                )
 
-        return inserted, updated
+def paper_to_batch_item(paper: PreparedPaper) -> BatchIngestItem:
+    return BatchIngestItem(
+        content=IngestedContent(
+            title=paper.title,
+            source=paper.source,
+            type=DocumentType.DOCUMENT,
+            content=paper.content,
+            metadata=paper.metadata,
+        ),
+        tags=paper.tags,
+        chunks=[ChunkText(content=paper.content, token_count=estimate_token_count(paper.content))],
+    )
 
-    result = await store.write(run)
-    return int(result[0]), int(result[1])
+
+def _batch_edge_policy(edge_policy: EdgePolicy) -> EdgePolicy:
+    if edge_policy == "recompute-after-insert":
+        return "skip"
+    return edge_policy
+
+
+def _existing_snapshot_select_sql() -> str:
+    return """
+    SELECT d.id,
+           d.source,
+           d.content_hash,
+           d.metadata,
+           COALESCE(
+             (
+               SELECT json_group_array(tag)
+               FROM (SELECT tag FROM tags WHERE document_id = d.id ORDER BY tag)
+             ),
+             '[]'
+           ) AS tags
+    FROM documents d
+    """
+
+
+def snapshot_from_row(row: tuple[Any, ...]) -> tuple[str, ExistingDocumentSnapshot]:
+    source = str(row[1])
+    return (
+        source,
+        ExistingDocumentSnapshot(
+            id=str(row[0]),
+            source=source,
+            content_hash=str(row[2]),
+            metadata=json_loads(str(row[3] or "")),
+            tags=list(json.loads(str(row[4] or "[]"))),
+        ),
+    )
+
+
+def paper_matches_snapshot(paper: PreparedPaper, snapshot: ExistingDocumentSnapshot) -> bool:
+    return (
+        paper.content_hash == snapshot.content_hash
+        and sorted(paper.tags) == sorted(snapshot.tags)
+        and comparable_metadata(paper.metadata) == comparable_metadata(snapshot.metadata)
+    )
+
+
+def comparable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metadata.items() if key != "import_timestamp"}
 
 
 def selected_by_filters(
@@ -564,7 +618,6 @@ def create_progress() -> Progress:
 def update_progress(
     progress: Progress | None,
     scan_task: TaskID | None,
-    selected_task: TaskID | None,
     *,
     pending_bytes: int,
     stats: ImportStats,
@@ -574,8 +627,6 @@ def update_progress(
     if pending_bytes:
         progress.advance(scan_task, pending_bytes)
     progress.update(scan_task, stats=format_progress_stats(stats))
-    if selected_task is not None:
-        progress.update(selected_task, completed=stats.selected, stats=format_progress_stats(stats))
 
 
 def format_progress_stats(stats: ImportStats) -> str:
@@ -597,6 +648,12 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--progress-every", type=int, default=1000)
+    parser.add_argument(
+        "--edge-policy",
+        choices=("skip", "incremental", "recompute-after-insert"),
+        default="recompute-after-insert",
+        help="How to create similarity graph edges after bulk ingest.",
+    )
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
@@ -615,6 +672,7 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
         batch_size=args.batch_size,
         dry_run=args.dry_run,
         progress_every=args.progress_every,
+        edge_policy=args.edge_policy,
     )
 
 

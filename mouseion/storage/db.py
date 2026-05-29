@@ -43,6 +43,26 @@ class QueryResult:
         return self.rows[0] if self.rows else None
 
 
+@dataclass(slots=True)
+class DocumentChunkUpsert:
+    document_id: UUID | None
+    doc_type: DocumentType
+    title: str
+    source: str
+    content_hash: str
+    tags: list[str]
+    metadata: dict[str, Any]
+    chunks: list[tuple[str, int, list[float]]]
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentChunkUpsertResult:
+    document_id: UUID
+    source: str
+    action: str
+    chunks_created: int
+
+
 class SQLiteStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -147,6 +167,36 @@ class SQLiteStore:
         row = result.first()
         return None if row is None else document_from_row(row)
 
+    async def find_documents_for_ingest(
+        self, identities: list[tuple[DocumentType, str, str]]
+    ) -> dict[tuple[DocumentType, str], Document]:
+        found: dict[tuple[DocumentType, str], Document] = {}
+        values_by_type: dict[DocumentType, set[str]] = {}
+        for doc_type, source, content_hash in identities:
+            identity_value = content_hash if doc_type == DocumentType.MEMORY else source
+            values_by_type.setdefault(doc_type, set()).add(identity_value)
+
+        for doc_type, identity_values in values_by_type.items():
+            identity_column = "content_hash" if doc_type == DocumentType.MEMORY else "source"
+            for batch in _batched(sorted(identity_values), 900):
+                placeholders = ",".join("?" for _ in batch)
+                result = await self.execute(
+                    f"""
+                    {_document_select_sql()}
+                    WHERE d.type = ? AND d.{identity_column} IN ({placeholders})
+                    """,
+                    (str(doc_type), *batch),
+                )
+                for row in result.rows:
+                    document = document_from_row(row)
+                    key_value = (
+                        document.content_hash
+                        if document.type == DocumentType.MEMORY
+                        else document.source
+                    )
+                    found[(document.type, key_value)] = document
+        return found
+
     async def get_document(self, document_id: UUID) -> Document | None:
         result = await self.execute(
             f"{_document_select_sql()} WHERE d.id = ?",
@@ -238,80 +288,129 @@ class SQLiteStore:
         metadata: dict[str, Any],
         chunks: list[tuple[str, int, list[float]]],
     ) -> tuple[UUID, str, int]:
+        results = await self.upsert_documents_with_chunks(
+            [
+                DocumentChunkUpsert(
+                    document_id=document_id,
+                    doc_type=doc_type,
+                    title=title,
+                    source=source,
+                    content_hash=content_hash,
+                    tags=tags,
+                    metadata=metadata,
+                    chunks=chunks,
+                )
+            ]
+        )
+        result = results[0]
+        return result.document_id, result.action, result.chunks_created
+
+    async def upsert_documents_with_chunks(
+        self, documents: list[DocumentChunkUpsert]
+    ) -> list[DocumentChunkUpsertResult]:
+        if not documents:
+            return []
+
         now = utc_now()
-        action = "replaced" if document_id is not None else "created"
-        doc_id = document_id or uuid4()
 
-        def run(conn: apsw.Connection) -> int:
-            existing = _fetch_one(conn, "SELECT id FROM documents WHERE id = ?", (str(doc_id),))
-            if existing:
-                conn.execute("DELETE FROM chunks WHERE document_id = ?", (str(doc_id),))
-                conn.execute("DELETE FROM tags WHERE document_id = ?", (str(doc_id),))
-                conn.execute(
-                    """
-                    UPDATE documents
-                    SET type = ?,
-                        title = ?,
-                        source = ?,
-                        content_hash = ?,
-                        updated_at = ?,
-                        metadata = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        str(doc_type),
-                        title,
-                        source,
-                        content_hash,
-                        _to_db_timestamp(now),
-                        json_dumps(metadata),
-                        str(doc_id),
-                    ),
+        def run(conn: apsw.Connection) -> list[DocumentChunkUpsertResult]:
+            now_timestamp = _to_db_timestamp(now)
+            document_ids = [document.document_id or uuid4() for document in documents]
+            provided_ids = [str(document_id) for document_id in document_ids]
+            existing_ids: set[str] = set()
+            for id_batch in _batched(provided_ids, 900):
+                placeholders = ",".join("?" for _ in id_batch)
+                rows = conn.cursor().execute(
+                    f"SELECT id FROM documents WHERE id IN ({placeholders})",
+                    id_batch,
                 )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO documents(
-                        id, type, title, source, content_hash, created_at, updated_at, metadata
+                existing_ids.update(str(row[0]) for row in rows)
+
+            max_chunk_row = _fetch_one(conn, "SELECT COALESCE(max(id), 0) AS max_id FROM chunks")
+            next_chunk_id = int(max_chunk_row["max_id"] if max_chunk_row else 0)
+            document_rows: list[tuple[Any, ...]] = []
+            tag_rows: list[tuple[str, str]] = []
+            chunk_rows: list[tuple[int, str, str, int, int, str]] = []
+            vector_rows: list[tuple[int, bytes]] = []
+            existing_document_ids: list[str] = []
+            results: list[DocumentChunkUpsertResult] = []
+
+            for document_id, document in zip(document_ids, documents, strict=True):
+                document_id_text = str(document_id)
+                exists = document_id_text in existing_ids
+                if exists:
+                    existing_document_ids.append(document_id_text)
+
+                document_rows.append(
+                    (
+                        document_id_text,
+                        str(document.doc_type),
+                        document.title,
+                        document.source,
+                        document.content_hash,
+                        now_timestamp,
+                        now_timestamp,
+                        json_dumps(document.metadata),
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(doc_id),
-                        str(doc_type),
-                        title,
-                        source,
-                        content_hash,
-                        _to_db_timestamp(now),
-                        _to_db_timestamp(now),
-                        json_dumps(metadata),
-                    ),
+                )
+                tag_rows.extend((document_id_text, tag) for tag in document.tags)
+                for chunk_index, (content, token_count, embedding) in enumerate(document.chunks):
+                    next_chunk_id += 1
+                    chunk_rows.append(
+                        (
+                            next_chunk_id,
+                            document_id_text,
+                            content,
+                            chunk_index,
+                            token_count,
+                            now_timestamp,
+                        )
+                    )
+                    vector_rows.append((next_chunk_id, _embedding_blob(embedding)))
+                results.append(
+                    DocumentChunkUpsertResult(
+                        document_id=document_id,
+                        source=document.source,
+                        action="replaced" if exists else "created",
+                        chunks_created=len(document.chunks),
+                    )
                 )
 
-            for tag in tags:
-                conn.execute(
-                    "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
-                    (str(doc_id), tag),
+            _delete_document_children(conn, existing_document_ids)
+            conn.executemany(
+                """
+                INSERT INTO documents(
+                    id, type, title, source, content_hash, created_at, updated_at, metadata
                 )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    type = excluded.type,
+                    title = excluded.title,
+                    source = excluded.source,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at,
+                    metadata = excluded.metadata
+                """,
+                document_rows,
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO tags(document_id, tag) VALUES(?, ?)",
+                tag_rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO chunks(id, document_id, content, chunk_index, token_count, created_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                chunk_rows,
+            )
+            conn.executemany(
+                "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+                vector_rows,
+            )
+            return results
 
-            for index, (content, token_count, embedding) in enumerate(chunks):
-                conn.execute(
-                    """
-                    INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (str(doc_id), content, index, token_count, _to_db_timestamp(now)),
-                )
-                chunk_id = conn.last_insert_rowid()
-                conn.execute(
-                    "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-                    (chunk_id, _embedding_blob(embedding)),
-                )
-
-            return len(chunks)
-
-        chunks_created = await self.write(run)
-        return doc_id, action, chunks_created
+        return await self.write(run)
 
     async def delete_document(self, document_id: UUID) -> tuple[int, int]:
         def run(conn: apsw.Connection) -> tuple[int, int]:
@@ -465,6 +564,19 @@ def _count(conn: apsw.Connection, query: str, parameters: tuple[Any, ...] = ()) 
     if not row:
         return 0
     return int(next(iter(row.values())))
+
+
+def _batched[T](items: list[T], size: int) -> list[list[T]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) -> None:
+    if not document_ids:
+        return
+    for document_id_batch in _batched(document_ids, 900):
+        placeholders = ",".join("?" for _ in document_id_batch)
+        conn.execute(f"DELETE FROM chunks WHERE document_id IN ({placeholders})", document_id_batch)
+        conn.execute(f"DELETE FROM tags WHERE document_id IN ({placeholders})", document_id_batch)
 
 
 def _document_select_sql() -> str:

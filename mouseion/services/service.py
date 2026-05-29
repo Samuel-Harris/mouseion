@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID, uuid4
 
 import apsw
@@ -10,7 +11,10 @@ from mouseion.domain.models import (
     AddMemoryInput,
     AddRepoInput,
     AddUrlInput,
+    BatchIngestItem,
+    ChunkText,
     DeleteInput,
+    Document,
     DocumentType,
     GetDocumentInput,
     IngestedContent,
@@ -27,8 +31,21 @@ from mouseion.ingest.repo import RepoService
 from mouseion.services.exporter import Exporter
 from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
-from mouseion.storage.db import SQLiteStore, document_from_row
+from mouseion.storage.db import DocumentChunkUpsert, SQLiteStore, document_from_row
 from mouseion.support.utils import canonical_text_hash, deterministic_edge_id
+
+EdgePolicy = Literal["skip", "incremental", "recompute-after-insert"]
+
+
+@dataclass(slots=True)
+class _PreparedBatchItem:
+    content: IngestedContent
+    source: str
+    content_hash: str
+    tags: list[str]
+    explicit_chunks: list[ChunkText] | None
+    document_id: UUID | None = None
+    chunks: list[ChunkText] | None = None
 
 
 @dataclass(slots=True)
@@ -166,38 +183,136 @@ class MouseionService:
         return counts
 
     async def _ingest(self, content: IngestedContent, tags: list[str]) -> dict:
-        content_hash = canonical_text_hash(content.content)
-        source = content.source
-        existing = await self.store.find_document_for_ingest(
-            content.type, source=source, content_hash=content_hash
+        output = await self.batch_ingest(
+            [BatchIngestItem(content=content, tags=tags)],
+            edge_policy="incremental",
         )
-        if content.type == DocumentType.MEMORY and existing is None:
-            source = f"memory:{uuid4()}"
-        chunks = self.chunker.chunk(content.content)
-        embeddings = await self.embedder.embed_many([chunk.content for chunk in chunks])
-        chunk_rows = [
-            (chunk.content, chunk.token_count, embedding)
-            for chunk, embedding in zip(chunks, embeddings, strict=True)
-        ]
-        document_id, action, chunks_created = await self.store.upsert_document_with_chunks(
-            document_id=existing.id if existing else None,
-            doc_type=content.type,
-            title=content.title,
-            source=source,
-            content_hash=content_hash,
-            tags=tags,
-            metadata=content.metadata,
-            chunks=chunk_rows,
-        )
-        edges_created = await self.graph.create_incremental_edges(document_id)
+        document = output["documents"][0]
         return {
-            "document_id": str(document_id),
+            "document_id": document["document_id"],
             "title": content.title,
-            "chunks_created": chunks_created,
-            "edges_created": edges_created,
+            "chunks_created": document["chunks_created"],
+            "edges_created": output["edges_created"],
             "status": "ok",
-            "action": action,
+            "action": document["action"],
         }
+
+    async def batch_ingest(
+        self,
+        items: list[BatchIngestItem],
+        *,
+        edge_policy: EdgePolicy = "incremental",
+        skip_unchanged: bool = False,
+        metadata_compare_exclude: set[str] | None = None,
+    ) -> dict:
+        if not items:
+            return _empty_batch_ingest_output(edge_policy)
+        if edge_policy not in {"skip", "incremental", "recompute-after-insert"}:
+            raise ValueError(f"Unsupported edge policy: {edge_policy}")
+
+        prepared = [_prepare_batch_item(item) for item in items]
+        existing = await self.store.find_documents_for_ingest(
+            [(item.content.type, item.source, item.content_hash) for item in prepared]
+        )
+
+        writable = []
+        skipped_documents = []
+        for item in prepared:
+            identity = _ingest_identity(item.content.type, item.source, item.content_hash)
+            existing_document = existing.get((item.content.type, identity))
+            if (
+                skip_unchanged
+                and existing_document is not None
+                and _matches_existing(item, existing_document, metadata_compare_exclude or set())
+            ):
+                skipped_documents.append(
+                    {
+                        "document_id": str(existing_document.id),
+                        "source": existing_document.source,
+                        "title": item.content.title,
+                        "action": "skipped",
+                        "chunks_created": 0,
+                    }
+                )
+                continue
+            if item.content.type == DocumentType.MEMORY and existing_document is None:
+                item.source = f"memory:{uuid4()}"
+            item.document_id = existing_document.id if existing_document else None
+            writable.append(item)
+
+        flat_chunk_texts: list[str] = []
+        for item in writable:
+            item.chunks = item.explicit_chunks or self.chunker.chunk(item.content.content)
+            flat_chunk_texts.extend(chunk.content for chunk in item.chunks)
+        if not writable:
+            return _batch_ingest_output(
+                edge_policy=edge_policy,
+                documents=skipped_documents,
+                inserted=0,
+                updated=0,
+                skipped=len(skipped_documents),
+                chunks_created=0,
+                edges_created=0,
+            )
+
+        embeddings = await self.embedder.embed_many(flat_chunk_texts)
+        offset = 0
+        upserts: list[DocumentChunkUpsert] = []
+        for item in writable:
+            if item.chunks is None:
+                raise RuntimeError("batch ingest item was not chunked")
+            count = len(item.chunks)
+            chunk_embeddings = embeddings[offset : offset + count]
+            offset += count
+            upserts.append(
+                DocumentChunkUpsert(
+                    document_id=item.document_id,
+                    doc_type=item.content.type,
+                    title=item.content.title,
+                    source=item.source,
+                    content_hash=item.content_hash,
+                    tags=item.tags,
+                    metadata=item.content.metadata,
+                    chunks=[
+                        (chunk.content, chunk.token_count, embedding)
+                        for chunk, embedding in zip(item.chunks, chunk_embeddings, strict=True)
+                    ],
+                )
+            )
+
+        upsert_results = await self.store.upsert_documents_with_chunks(upserts)
+        document_outputs = [
+            {
+                "document_id": str(result.document_id),
+                "source": result.source,
+                "title": item.content.title,
+                "action": result.action,
+                "chunks_created": result.chunks_created,
+            }
+            for item, result in zip(writable, upsert_results, strict=True)
+        ]
+        document_outputs.extend(skipped_documents)
+
+        edges_created = 0
+        if edge_policy == "incremental":
+            for result in upsert_results:
+                edges_created += await self.graph.create_incremental_edges(result.document_id)
+        elif edge_policy == "recompute-after-insert" and upsert_results:
+            recompute = await self.graph.recompute_all()
+            edges_created = int(recompute["edges_created"])
+
+        inserted = sum(1 for result in upsert_results if result.action == "created")
+        updated = sum(1 for result in upsert_results if result.action == "replaced")
+        skipped = len(skipped_documents)
+        return _batch_ingest_output(
+            edge_policy=edge_policy,
+            documents=document_outputs,
+            inserted=inserted,
+            updated=updated,
+            skipped=skipped,
+            chunks_created=sum(result.chunks_created for result in upsert_results),
+            edges_created=edges_created,
+        )
 
     async def _related_documents(self, document_id: UUID) -> list[dict]:
         result = await self.store.execute(
@@ -240,3 +355,66 @@ class MouseionService:
                 }
             )
         return related
+
+
+def _empty_batch_ingest_output(edge_policy: EdgePolicy) -> dict:
+    return _batch_ingest_output(
+        edge_policy=edge_policy,
+        documents=[],
+        inserted=0,
+        updated=0,
+        skipped=0,
+        chunks_created=0,
+        edges_created=0,
+    )
+
+
+def _batch_ingest_output(
+    *,
+    edge_policy: EdgePolicy,
+    documents: list[dict],
+    inserted: int,
+    updated: int,
+    skipped: int,
+    chunks_created: int,
+    edges_created: int,
+) -> dict:
+    return {
+        "status": "ok",
+        "edge_policy": edge_policy,
+        "documents": documents,
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "chunks_created": chunks_created,
+        "edges_created": edges_created,
+    }
+
+
+def _prepare_batch_item(item: BatchIngestItem) -> _PreparedBatchItem:
+    return _PreparedBatchItem(
+        content=item.content,
+        source=item.content.source,
+        content_hash=canonical_text_hash(item.content.content),
+        tags=item.tags,
+        explicit_chunks=item.chunks,
+    )
+
+
+def _ingest_identity(doc_type: DocumentType, source: str, content_hash: str) -> str:
+    return content_hash if doc_type == DocumentType.MEMORY else source
+
+
+def _matches_existing(
+    item: _PreparedBatchItem, document: Document, metadata_compare_exclude: set[str]
+) -> bool:
+    return (
+        item.content_hash == document.content_hash
+        and sorted(item.tags) == sorted(document.tags)
+        and _comparable_metadata(item.content.metadata, metadata_compare_exclude)
+        == _comparable_metadata(document.metadata, metadata_compare_exclude)
+    )
+
+
+def _comparable_metadata(metadata: dict[str, object], excluded_keys: set[str]) -> dict[str, object]:
+    return {key: value for key, value in metadata.items() if key not in excluded_keys}

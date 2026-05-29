@@ -2,6 +2,12 @@
 
 Mouseion is a local-first personal knowledge base. It runs as a single Python daemon, stores documents and chunks in SQLite with `sqlite-vec` and FTS5, embeds chunks through local Ollama, and exposes retrieval/admin operations through HTTP MCP tools plus a small web UI.
 
+## Name
+
+The name `Mouseion` refers to the Mouseion of Alexandria, an ancient institution associated with the Library of Alexandria. A mouseion was originally a place dedicated to the Muses, then came to describe centers of learning such as Plato's Academy and Aristotle's Lyceum. The Alexandrian Mouseion is remembered as an effort to gather leading scholars and collect the books known at the time.
+
+This project borrows the name for the same basic idea at a personal scale: a local place to collect, organize, relate, and retrieve knowledge.
+
 ## Runtime
 
 - Python 3.13
