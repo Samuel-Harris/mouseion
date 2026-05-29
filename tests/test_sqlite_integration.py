@@ -201,6 +201,38 @@ async def test_batch_ingest_batches_embeddings_and_can_skip_edges(
     assert int(similar_edges.first()["total"]) == 0  # type: ignore[index]
 
 
+async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+
+    output = await service.batch_ingest(
+        [
+            _batch_item("batch:dupe", "First duplicate batch document"),
+            _batch_item("batch:dupe", "Second duplicate batch document"),
+        ],
+        edge_policy="skip",
+    )
+    documents = await store.execute(
+        "SELECT count(*) AS total FROM documents WHERE type = ? AND source = ?",
+        (str(DocumentType.DOCUMENT), "batch:dupe"),
+    )
+    chunks = await store.execute(
+        """
+        SELECT c.content
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE d.source = ?
+        """,
+        ("batch:dupe",),
+    )
+
+    assert output["inserted"] == 1
+    assert output["updated"] == 1
+    assert int(documents.first()["total"]) == 1  # type: ignore[index]
+    assert chunks.rows == [{"content": "Second duplicate batch document"}]
+
+
 async def test_batch_ingest_recomputes_edges_after_insert(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:

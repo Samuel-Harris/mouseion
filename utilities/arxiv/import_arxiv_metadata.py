@@ -13,9 +13,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import apsw
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -43,9 +42,9 @@ from mouseion.ingest.repo import RepoService
 from mouseion.services.exporter import Exporter
 from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
-from mouseion.services.service import EdgePolicy, MouseionService
-from mouseion.storage.db import SQLiteStore, _fetch_one
-from mouseion.support.utils import canonical_text_hash, json_loads
+from mouseion.services.service import EdgePolicy, MouseionService, preview_batch_ingest
+from mouseion.storage.db import SQLiteStore
+from mouseion.support.utils import canonical_text_hash
 
 DEFAULT_INPUT = Path("raw_data/raw-kaggle-arxiv-metadata-2026-05-29.json")
 DEFAULT_CATEGORIES_JSON = Path("utilities/arxiv/categories.json")
@@ -118,15 +117,6 @@ class PreparedPaper:
     unresolved_categories: list[str]
 
 
-@dataclass(frozen=True, slots=True)
-class ExistingDocumentSnapshot:
-    id: str
-    source: str
-    content_hash: str
-    tags: list[str]
-    metadata: dict[str, Any]
-
-
 @dataclass(slots=True)
 class ImportStats:
     selected: int = 0
@@ -135,7 +125,7 @@ class ImportStats:
     skipped: int = 0
     failed: int = 0
     edges_created: int = 0
-    unresolved_categories: Counter[str] = field(default_factory=Counter)
+    unresolved_categories: Counter[str] = field(default_factory=Counter[str])
     elapsed_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -151,75 +141,35 @@ class ImportStats:
         }
 
 
-class DryRunDocumentLookup:
-    def __init__(self, sqlite_path: Path) -> None:
-        self.connection: apsw.Connection | None = None
-        if sqlite_path.exists():
-            self.connection = apsw.Connection(str(sqlite_path), flags=apsw.SQLITE_OPEN_READONLY)
-
-    def exists(self, source: str) -> bool:
-        if self.connection is None:
-            return False
-        row = _fetch_one(
-            self.connection,
-            "SELECT id FROM documents WHERE type = ? AND source = ? LIMIT 1",
-            (str(DocumentType.DOCUMENT), source),
-        )
-        return row is not None
-
-    def existing_sources(self, sources: list[str]) -> set[str]:
-        if self.connection is None or not sources:
-            return set()
-        return set(self.existing_snapshots(sources))
-
-    def existing_snapshots(self, sources: list[str]) -> dict[str, ExistingDocumentSnapshot]:
-        if self.connection is None or not sources:
-            return {}
-        snapshots: dict[str, ExistingDocumentSnapshot] = {}
-        for source_batch in batched(sources, 900):
-            placeholders = ",".join("?" for _ in source_batch)
-            rows = self.connection.cursor().execute(
-                f"""
-                {_existing_snapshot_select_sql()}
-                WHERE d.type = ? AND d.source IN ({placeholders})
-                """,
-                (str(DocumentType.DOCUMENT), *source_batch),
-            )
-            snapshots.update(snapshot_from_row(row) for row in rows)
-        return snapshots
-
-    def close(self) -> None:
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
-
-
 def load_category_catalog(path: Path) -> CategoryCatalog:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw: object = json.loads(path.read_text(encoding="utf-8"))
     categories: dict[str, CategoryEntry] = {}
     groups: dict[str, str] = {}
 
     if not isinstance(raw, list):
         raise ValueError(f"Expected {path} to contain a list of arXiv category groups")
 
-    for group_item in raw:
+    for group_item in cast(list[object], raw):
         if not isinstance(group_item, dict):
             continue
-        for group_name, entries in group_item.items():
+        group_mapping = cast(dict[object, object], group_item)
+        for group_name, entries in group_mapping.items():
             group_slug = slugify(str(group_name))
             groups[group_slug] = str(group_name)
             if not isinstance(entries, list):
                 continue
-            for entry_item in entries:
+            for entry_item in cast(list[object], entries):
                 if not isinstance(entry_item, dict):
                     continue
-                for code, details in entry_item.items():
+                entry_mapping = cast(dict[object, object], entry_item)
+                for code, details in entry_mapping.items():
                     if not isinstance(details, dict):
                         continue
+                    details_mapping = cast(dict[object, object], details)
                     category = CategoryEntry(
                         code=str(code),
-                        name=str(details.get("name") or ""),
-                        description=str(details.get("description") or ""),
+                        name=str(details_mapping.get("name") or ""),
+                        description=str(details_mapping.get("description") or ""),
                         group=str(group_name),
                         group_slug=group_slug,
                     )
@@ -315,14 +265,15 @@ async def import_arxiv_metadata(
 
     store: SQLiteStore | None = None
     service: MouseionService | None = None
-    dry_lookup: DryRunDocumentLookup | None = None
     active_embedder = embedder
     progress = create_progress() if options.progress_every > 0 else None
     scan_task: TaskID | None = None
     input_size = options.input.stat().st_size
 
     if options.dry_run:
-        dry_lookup = DryRunDocumentLookup(settings.sqlite_path)
+        dry_store = SQLiteStore(settings)
+        if await dry_store.open_readonly_if_exists():
+            store = dry_store
     else:
         active_embedder = active_embedder or Embedder(settings)
         await ensure_embedding_backend_ready(active_embedder)
@@ -370,14 +321,15 @@ async def import_arxiv_metadata(
                         stats.skipped += 1
                         continue
                     try:
-                        record = json.loads(line)
+                        loaded_record: object = json.loads(line)
                     except json.JSONDecodeError as exc:
                         stats.failed += 1
                         print(f"line {line_number}: invalid JSON: {exc}", file=sys.stderr)
                         continue
-                    if not isinstance(record, dict):
+                    if not isinstance(loaded_record, dict):
                         stats.skipped += 1
                         continue
+                    record = cast(dict[str, Any], loaded_record)
 
                     paper = prepare_record(
                         record,
@@ -404,7 +356,7 @@ async def import_arxiv_metadata(
                     if len(batch) >= options.batch_size:
                         await flush_batch(
                             service=service,
-                            dry_lookup=dry_lookup,
+                            dry_store=store if options.dry_run else None,
                             batch=batch,
                             stats=stats,
                             edge_policy=_batch_edge_policy(options.edge_policy),
@@ -423,7 +375,7 @@ async def import_arxiv_metadata(
             if batch:
                 await flush_batch(
                     service=service,
-                    dry_lookup=dry_lookup,
+                    dry_store=store if options.dry_run else None,
                     batch=batch,
                     stats=stats,
                     edge_policy=_batch_edge_policy(options.edge_policy),
@@ -452,8 +404,6 @@ async def import_arxiv_metadata(
     finally:
         if store is not None:
             await store.close()
-        if dry_lookup is not None:
-            dry_lookup.close()
 
     stats.elapsed_seconds = time.monotonic() - start
     return stats
@@ -462,25 +412,23 @@ async def import_arxiv_metadata(
 async def flush_batch(
     *,
     service: MouseionService | None,
-    dry_lookup: DryRunDocumentLookup | None,
+    dry_store: SQLiteStore | None,
     batch: list[PreparedPaper],
     stats: ImportStats,
     edge_policy: EdgePolicy,
 ) -> None:
-    if dry_lookup is not None:
-        existing = dry_lookup.existing_snapshots([paper.source for paper in batch])
-        for paper in batch:
-            snapshot = existing.get(paper.source)
-            if snapshot is None:
-                stats.inserted += 1
-            elif paper_matches_snapshot(paper, snapshot):
-                stats.skipped += 1
-            else:
-                stats.updated += 1
-        return
-
     if service is None:
-        raise RuntimeError("import batch requires an open Mouseion service")
+        output = await preview_batch_ingest(
+            dry_store,
+            [paper_to_batch_item(paper) for paper in batch],
+            edge_policy=edge_policy,
+            skip_unchanged=True,
+            metadata_compare_exclude={"import_timestamp"},
+        )
+        stats.inserted += int(output["inserted"])
+        stats.updated += int(output["updated"])
+        stats.skipped += int(output["skipped"])
+        return
 
     try:
         output = await service.batch_ingest(
@@ -507,10 +455,6 @@ async def ensure_embedding_backend_ready(embedder: object) -> None:
     await ensure_ready()
 
 
-def batched[T](items: list[T], size: int) -> list[list[T]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
 def estimate_token_count(text: str) -> int:
     return max(1, len(text.split()))
 
@@ -533,49 +477,6 @@ def _batch_edge_policy(edge_policy: EdgePolicy) -> EdgePolicy:
     if edge_policy == "recompute-after-insert":
         return "skip"
     return edge_policy
-
-
-def _existing_snapshot_select_sql() -> str:
-    return """
-    SELECT d.id,
-           d.source,
-           d.content_hash,
-           d.metadata,
-           COALESCE(
-             (
-               SELECT json_group_array(tag)
-               FROM (SELECT tag FROM tags WHERE document_id = d.id ORDER BY tag)
-             ),
-             '[]'
-           ) AS tags
-    FROM documents d
-    """
-
-
-def snapshot_from_row(row: tuple[Any, ...]) -> tuple[str, ExistingDocumentSnapshot]:
-    source = str(row[1])
-    return (
-        source,
-        ExistingDocumentSnapshot(
-            id=str(row[0]),
-            source=source,
-            content_hash=str(row[2]),
-            metadata=json_loads(str(row[3] or "")),
-            tags=list(json.loads(str(row[4] or "[]"))),
-        ),
-    )
-
-
-def paper_matches_snapshot(paper: PreparedPaper, snapshot: ExistingDocumentSnapshot) -> bool:
-    return (
-        paper.content_hash == snapshot.content_hash
-        and sorted(paper.tags) == sorted(snapshot.tags)
-        and comparable_metadata(paper.metadata) == comparable_metadata(snapshot.metadata)
-    )
-
-
-def comparable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in metadata.items() if key != "import_timestamp"}
 
 
 def selected_by_filters(

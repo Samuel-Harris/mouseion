@@ -55,7 +55,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["mouseion"]
+include = ["mouseion", "utilities"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 reportUnusedFunction = false

@@ -50,6 +50,12 @@ class _PreparedBatchItem:
 
 
 @dataclass(slots=True)
+class _BatchIngestPlan:
+    writable: list[_PreparedBatchItem]
+    skipped_documents: list[JsonDict]
+
+
+@dataclass(slots=True)
 class MouseionService:
     store: SQLiteStore
     ingestor: Ingestor
@@ -211,35 +217,13 @@ class MouseionService:
         if edge_policy not in {"skip", "incremental", "recompute-after-insert"}:
             raise ValueError(f"Unsupported edge policy: {edge_policy}")
 
-        prepared = [_prepare_batch_item(item) for item in items]
-        existing = await self.store.find_documents_for_ingest(
-            [(item.content.type, item.source, item.content_hash) for item in prepared]
+        plan = await _plan_batch_ingest(
+            self.store,
+            items,
+            skip_unchanged=skip_unchanged,
+            metadata_compare_exclude=metadata_compare_exclude or set(),
         )
-
-        writable: list[_PreparedBatchItem] = []
-        skipped_documents: list[JsonDict] = []
-        for item in prepared:
-            identity = _ingest_identity(item.content.type, item.source, item.content_hash)
-            existing_document = existing.get((item.content.type, identity))
-            if (
-                skip_unchanged
-                and existing_document is not None
-                and _matches_existing(item, existing_document, metadata_compare_exclude or set())
-            ):
-                skipped_documents.append(
-                    {
-                        "document_id": str(existing_document.id),
-                        "source": existing_document.source,
-                        "title": item.content.title,
-                        "action": "skipped",
-                        "chunks_created": 0,
-                    }
-                )
-                continue
-            if item.content.type == DocumentType.MEMORY and existing_document is None:
-                item.source = f"memory:{uuid4()}"
-            item.document_id = existing_document.id if existing_document else None
-            writable.append(item)
+        writable = plan.writable
 
         flat_chunk_texts: list[str] = []
         for item in writable:
@@ -248,10 +232,10 @@ class MouseionService:
         if not writable:
             return _batch_ingest_output(
                 edge_policy=edge_policy,
-                documents=skipped_documents,
+                documents=plan.skipped_documents,
                 inserted=0,
                 updated=0,
-                skipped=len(skipped_documents),
+                skipped=len(plan.skipped_documents),
                 chunks_created=0,
                 edges_created=0,
             )
@@ -292,7 +276,7 @@ class MouseionService:
             }
             for item, result in zip(writable, upsert_results, strict=True)
         ]
-        document_outputs.extend(skipped_documents)
+        document_outputs.extend(plan.skipped_documents)
 
         edges_created = 0
         if edge_policy == "incremental":
@@ -304,7 +288,7 @@ class MouseionService:
 
         inserted = sum(1 for result in upsert_results if result.action == "created")
         updated = sum(1 for result in upsert_results if result.action == "replaced")
-        skipped = len(skipped_documents)
+        skipped = len(plan.skipped_documents)
         return _batch_ingest_output(
             edge_policy=edge_policy,
             documents=document_outputs,
@@ -358,6 +342,93 @@ class MouseionService:
         return related
 
 
+async def preview_batch_ingest(
+    store: SQLiteStore | None,
+    items: list[BatchIngestItem],
+    *,
+    edge_policy: EdgePolicy = "skip",
+    skip_unchanged: bool = False,
+    metadata_compare_exclude: set[str] | None = None,
+) -> JsonDict:
+    if not items:
+        return _empty_batch_ingest_output(edge_policy)
+    if store is None:
+        documents = [
+            _preview_document_output(_prepare_batch_item(item), "created") for item in items
+        ]
+        return _batch_ingest_output(
+            edge_policy=edge_policy,
+            documents=documents,
+            inserted=len(documents),
+            updated=0,
+            skipped=0,
+            chunks_created=0,
+            edges_created=0,
+        )
+
+    plan = await _plan_batch_ingest(
+        store,
+        items,
+        skip_unchanged=skip_unchanged,
+        metadata_compare_exclude=metadata_compare_exclude or set(),
+    )
+    documents = [
+        _preview_document_output(item, "replaced" if item.document_id is not None else "created")
+        for item in plan.writable
+    ]
+    documents.extend(plan.skipped_documents)
+    inserted = sum(1 for item in plan.writable if item.document_id is None)
+    updated = len(plan.writable) - inserted
+    return _batch_ingest_output(
+        edge_policy=edge_policy,
+        documents=documents,
+        inserted=inserted,
+        updated=updated,
+        skipped=len(plan.skipped_documents),
+        chunks_created=0,
+        edges_created=0,
+    )
+
+
+async def _plan_batch_ingest(
+    store: SQLiteStore,
+    items: list[BatchIngestItem],
+    *,
+    skip_unchanged: bool,
+    metadata_compare_exclude: set[str],
+) -> _BatchIngestPlan:
+    prepared = [_prepare_batch_item(item) for item in items]
+    existing = await store.find_documents_for_ingest(
+        [(item.content.type, item.source, item.content_hash) for item in prepared]
+    )
+
+    writable: list[_PreparedBatchItem] = []
+    skipped_documents: list[JsonDict] = []
+    for item in prepared:
+        identity = _ingest_identity(item.content.type, item.source, item.content_hash)
+        existing_document = existing.get((item.content.type, identity))
+        if (
+            skip_unchanged
+            and existing_document is not None
+            and _matches_existing(item, existing_document, metadata_compare_exclude)
+        ):
+            skipped_documents.append(
+                {
+                    "document_id": str(existing_document.id),
+                    "source": existing_document.source,
+                    "title": item.content.title,
+                    "action": "skipped",
+                    "chunks_created": 0,
+                }
+            )
+            continue
+        if item.content.type == DocumentType.MEMORY and existing_document is None:
+            item.source = f"memory:{uuid4()}"
+        item.document_id = existing_document.id if existing_document else None
+        writable.append(item)
+    return _BatchIngestPlan(writable=writable, skipped_documents=skipped_documents)
+
+
 def _empty_batch_ingest_output(edge_policy: EdgePolicy) -> JsonDict:
     return _batch_ingest_output(
         edge_policy=edge_policy,
@@ -400,6 +471,16 @@ def _prepare_batch_item(item: BatchIngestItem) -> _PreparedBatchItem:
         tags=item.tags,
         explicit_chunks=item.chunks,
     )
+
+
+def _preview_document_output(item: _PreparedBatchItem, action: str) -> JsonDict:
+    return {
+        "document_id": str(item.document_id) if item.document_id is not None else None,
+        "source": item.source,
+        "title": item.content.title,
+        "action": action,
+        "chunks_created": 0,
+    }
 
 
 def _ingest_identity(doc_type: DocumentType, source: str, content_hash: str) -> str:
