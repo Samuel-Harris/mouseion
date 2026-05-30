@@ -14,17 +14,21 @@ from mouseion.domain.models import (
     AddMemoryInput,
     ChunkText,
     DeleteInput,
+    DocumentOutlineInput,
     DocumentType,
-    GetDocumentInput,
     IngestedContent,
     ListInput,
+    ReadDocumentInput,
+    SearchDocumentInput,
     SearchFilter,
     SearchInput,
 )
+from mouseion.errors import InvalidCursorError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
 from mouseion.services.bulk_ingest import BatchIngestItem, BulkIngestService
+from mouseion.services.document_reader import DocumentReader
 from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
@@ -57,14 +61,16 @@ async def mouseion_service(tmp_path: Path) -> AsyncIterator[tuple[SQLiteStore, M
     store = SQLiteStore(settings)
     await store.open()
     embedder = FakeEmbedder()
+    searcher = SearchService(store, embedder, settings.rrf_k)  # type: ignore[arg-type]
     service = MouseionService(
         store,
         Ingestor(settings),
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
-        SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
+        searcher,
         RepoService(settings),
         Exporter(settings, store),
+        DocumentReader(store, searcher),
     )
     try:
         yield store, service
@@ -193,8 +199,8 @@ async def test_memory_replacement_preserves_document_identity(
     replacement = await service.add_memory(
         AddMemoryInput(content="Stable memory one for replacement.", tags=["new"])
     )
-    document = await service.get_document(
-        GetDocumentInput(document_id=UUID(replacement["memory_id"]))
+    document = await service.read_document(
+        ReadDocumentInput(document_id=UUID(replacement["memory_id"]))
     )
 
     assert replacement["memory_id"] == first["memory_id"]
@@ -233,6 +239,148 @@ async def test_search_filter_is_applied_before_candidate_limit(
 
     assert len(result["results"]) == 1
     assert result["results"][0]["document"]["tags"] == ["target"]
+
+
+async def test_read_document_paginates_text_without_embeddings(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(
+        store,
+        "read:paginate",
+        ["abcdefghij", "klmnop"],
+        metadata={"author": "Ada"},
+    )
+
+    first = await service.read_document(
+        ReadDocumentInput(document_id=document_id, max_chars=4)
+    )
+    second = await service.read_document(
+        ReadDocumentInput(document_id=document_id, cursor=first["next_cursor"], max_chars=100)
+    )
+    tight = await service.read_document(
+        ReadDocumentInput(document_id=document_id, max_chars=12)
+    )
+
+    assert first["text"] == "abcd"
+    assert first["next_cursor"] is not None
+    assert "chunks" not in first
+    assert "embedding" not in str(first)
+    assert first["document"]["metadata"] == {"author": "Ada"}
+    assert first["pagination"]["end_chunk_index"] == 0
+    assert first["pagination"]["end_char_offset"] == 4
+    assert second["text"] == "efghij\n\nklmnop"
+    assert second["next_cursor"] is None
+    assert tight["text"] == "abcdefghij"
+    assert tight["pagination"]["chunks_returned"] == 1
+    assert tight["next_cursor"] is not None
+
+
+async def test_read_document_max_chunks_limits_traversal(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(store, "read:max-chunks", ["first", "second"])
+
+    first = await service.read_document(
+        ReadDocumentInput(document_id=document_id, max_chars=100, max_chunks=1)
+    )
+    second = await service.read_document(
+        ReadDocumentInput(document_id=document_id, cursor=first["next_cursor"], max_chars=100)
+    )
+
+    assert first["text"] == "first"
+    assert first["pagination"]["chunks_returned"] == 1
+    assert first["next_cursor"] is not None
+    assert second["text"] == "second"
+
+
+async def test_read_document_can_exclude_metadata(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(
+        store, "read:metadata", ["metadata body"], metadata={"raw": "present"}
+    )
+
+    included = await service.read_document(ReadDocumentInput(document_id=document_id))
+    excluded = await service.read_document(
+        ReadDocumentInput(document_id=document_id, include_metadata=False)
+    )
+
+    assert included["document"]["metadata"] == {"raw": "present"}
+    assert "metadata" not in excluded["document"]
+
+
+async def test_read_document_rejects_invalid_cursor(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(store, "read:invalid-cursor", ["body"])
+
+    with pytest.raises(InvalidCursorError, match="Invalid document cursor"):
+        await service.read_document(
+            ReadDocumentInput(document_id=document_id, cursor="not-a-valid-cursor")
+        )
+
+
+async def test_document_outline_derives_headings_and_totals(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(
+        store,
+        "outline:headings",
+        [
+            "# Introduction\n\nOpening paragraph.\n\n1. Method\n\nDetails.",
+            "Appendix A\n\nExtra notes.\n\n1. Method\n\nMore details.",
+        ],
+        title="Outlined Doc",
+    )
+
+    outline = await service.document_outline(DocumentOutlineInput(document_id=document_id))
+
+    assert outline["title"] == "Outlined Doc"
+    assert outline["source"] == "outline:headings"
+    assert outline["total_chunks"] == 2
+    assert outline["total_tokens"] == 15
+    assert [heading["text"] for heading in outline["headings"]] == [
+        "Introduction",
+        "1. Method",
+        "Appendix A",
+        "1. Method",
+    ]
+
+
+async def test_document_outline_returns_empty_for_unreliable_headings(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    document_id = await _stored_document(
+        store,
+        "outline:none",
+        ["this is just a normal paragraph with no reliable section breaks."],
+    )
+
+    outline = await service.document_outline(DocumentOutlineInput(document_id=document_id))
+
+    assert outline["headings"] == []
+
+
+async def test_search_document_only_returns_target_document_chunks(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    store, service = mouseion_service
+    target_id = await _stored_document(store, "search:target", ["needle target chunk"])
+    other_id = await _stored_document(store, "search:other", ["needle other chunk"])
+
+    result = await service.search_document(
+        SearchDocumentInput(document_id=target_id, query="needle", top_k=10)
+    )
+
+    assert result["results"]
+    assert {hit["document_id"] for hit in result["results"]} == {str(target_id)}
+    assert str(other_id) not in {hit["document_id"] for hit in result["results"]}
 
 
 async def test_exact_lexical_match_beats_unhelpful_vector_rank(
@@ -350,14 +498,16 @@ async def test_vector_only_search_requires_confident_similarity(tmp_path: Path) 
     store = SQLiteStore(settings)
     await store.open()
     embedder = OrthogonalSearchEmbedder()
+    searcher = SearchService(store, embedder, settings.rrf_k)  # type: ignore[arg-type]
     service = MouseionService(
         store,
         Ingestor(settings),
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
-        SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
+        searcher,
         RepoService(settings),
         Exporter(settings, store),
+        DocumentReader(store, searcher),
     )
     try:
         await service.add_memory(AddMemoryInput(content="Known stored memory.", tags=[]))
@@ -685,6 +835,31 @@ async def test_delete_cascades_chunks_fts_and_vectors(
     for query in counts.values():
         result = await store.execute(query)
         assert int(result.first()["total"]) == 0  # type: ignore[index]
+
+
+async def _stored_document(
+    store: SQLiteStore,
+    source: str,
+    chunks: list[str],
+    *,
+    title: str | None = None,
+    metadata: dict[str, object] | None = None,
+    tags: list[str] | None = None,
+) -> UUID:
+    document_id, _, _ = await store.upsert_document_with_chunks(
+        document_id=None,
+        doc_type=DocumentType.DOCUMENT,
+        title=title or source,
+        source=source,
+        content_hash=f"hash:{source}",
+        tags=tags or [],
+        metadata=metadata or {},
+        chunks=[
+            (content, len(content.split()), [0.0] * 767 + [1.0])
+            for content in chunks
+        ],
+    )
+    return document_id
 
 
 def _batch_item(

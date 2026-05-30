@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 
 from mouseion.domain.models import SearchFilter, normalize_tags
@@ -13,6 +15,12 @@ def test_normalize_tags_deduplicates_and_lowercases() -> None:
 
 def test_search_filter_normalizes_tags() -> None:
     assert SearchFilter(tags=[" Research ", "research"]).tags == ["research"]
+
+
+def test_search_filter_accepts_document_id() -> None:
+    document_id = UUID("00000000-0000-0000-0000-000000000123")
+
+    assert SearchFilter(document_id=str(document_id)).document_id == document_id
 
 
 def test_hash_canonicalizes_whitespace() -> None:

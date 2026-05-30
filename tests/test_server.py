@@ -8,6 +8,11 @@ from starlette.routing import Mount, Route
 
 from mouseion.api.mcp_tools import build_mcp
 from mouseion.api.server import create_app
+from mouseion.domain.models import (
+    DocumentOutlineInput,
+    ReadDocumentInput,
+    SearchDocumentInput,
+)
 
 
 def test_build_mcp_uses_custom_description() -> None:
@@ -32,6 +37,46 @@ def test_vector_api_routes_are_exposed() -> None:
     assert "/api/vector/mode" in paths
     assert "/api/vector/quantize" in paths
     assert "/api/vector/cleanup" in paths
+
+
+def test_document_read_outline_and_search_routes() -> None:
+    app = create_app()
+    app.state.service = FakeDocumentService()
+    client = TestClient(app)
+    document_id = "00000000-0000-0000-0000-000000000123"
+
+    read = client.get(
+        f"/api/documents/{document_id}/read",
+        params={
+            "cursor": "abc",
+            "max_chars": 123,
+            "max_chunks": 4,
+            "include_metadata": "false",
+        },
+    )
+    outline = client.get(f"/api/documents/{document_id}/outline")
+    search = client.post(
+        f"/api/documents/{document_id}/search",
+        json={"query": "needle", "top_k": 3},
+    )
+
+    assert read.status_code == 200
+    assert read.json() == {
+        "document_id": document_id,
+        "cursor": "abc",
+        "max_chars": 123,
+        "max_chunks": 4,
+        "include_metadata": False,
+    }
+    assert outline.status_code == 200
+    assert outline.json() == {"document_id": document_id, "headings": []}
+    assert search.status_code == 200
+    assert search.json() == {
+        "document_id": document_id,
+        "query": "needle",
+        "top_k": 3,
+        "results": [],
+    }
 
 
 def test_mcp_endpoint_runs_inside_main_lifespan(
@@ -62,3 +107,25 @@ def test_mcp_endpoint_runs_inside_main_lifespan(
     assert response.status_code != 404
     assert response.status_code != 500
     assert response.json()["result"]["instructions"] == "Test corpus description"
+
+
+class FakeDocumentService:
+    async def read_document(self, input: ReadDocumentInput) -> dict[str, object]:
+        return {
+            "document_id": str(input.document_id),
+            "cursor": input.cursor,
+            "max_chars": input.max_chars,
+            "max_chunks": input.max_chunks,
+            "include_metadata": input.include_metadata,
+        }
+
+    async def document_outline(self, input: DocumentOutlineInput) -> dict[str, object]:
+        return {"document_id": str(input.document_id), "headings": []}
+
+    async def search_document(self, input: SearchDocumentInput) -> dict[str, object]:
+        return {
+            "document_id": str(input.document_id),
+            "query": input.query,
+            "top_k": input.top_k,
+            "results": [],
+        }

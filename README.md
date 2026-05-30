@@ -93,12 +93,16 @@ Settings are loaded from `.env` and environment variables:
 - `mouseion_add_memory`
 - `mouseion_add_repo`
 - `mouseion_search`
-- `mouseion_get_document`
+- `mouseion_read_document`
+- `mouseion_document_outline`
+- `mouseion_search_document`
 - `mouseion_list`
 - `mouseion_delete`
 - `mouseion_export`
 
-All tools return JSON. The daemon does retrieval only; answer synthesis belongs to the calling AI harness.
+All tools return JSON. `mouseion_read_document` returns metadata, paged clean text, an
+opaque `next_cursor`, and pagination totals without returning embeddings. The daemon does
+retrieval only; answer synthesis belongs to the calling AI harness.
 
 ## Development
 

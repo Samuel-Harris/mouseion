@@ -44,6 +44,7 @@ class Chunk(BaseModel):
 class SearchFilter(BaseModel):
     tags: list[str] | None = None
     type: DocumentType | None = None
+    document_id: UUID | None = None
 
     @field_validator("tags")
     @classmethod
@@ -95,8 +96,22 @@ class SearchInput(BaseModel):
     search_syntax: Literal["plain", "advanced"] = "plain"
 
 
-class GetDocumentInput(BaseModel):
+class ReadDocumentInput(BaseModel):
     document_id: UUID
+    cursor: str | None = None
+    max_chars: int = Field(default=12000, ge=1, le=100000)
+    max_chunks: int = Field(default=8, ge=1, le=100)
+    include_metadata: bool = True
+
+
+class DocumentOutlineInput(BaseModel):
+    document_id: UUID
+
+
+class SearchDocumentInput(BaseModel):
+    document_id: UUID
+    query: str
+    top_k: int = Field(default=10, ge=1, le=100)
 
 
 class ListInput(BaseModel):

@@ -11,8 +11,10 @@ from mouseion.domain.models import (
     AddRepoInput,
     AddUrlInput,
     DeleteInput,
-    GetDocumentInput,
+    DocumentOutlineInput,
     ListInput,
+    ReadDocumentInput,
+    SearchDocumentInput,
     SearchFilter,
     SearchInput,
 )
@@ -69,8 +71,36 @@ def build_mcp(
         )
 
     @mcp.tool()
-    async def mouseion_get_document(document_id: str) -> dict[str, Any]:
-        return await service().get_document(GetDocumentInput(document_id=UUID(document_id)))
+    async def mouseion_read_document(
+        document_id: str,
+        cursor: str | None = None,
+        max_chars: int = 12000,
+        max_chunks: int = 8,
+        include_metadata: bool = True,
+    ) -> dict[str, Any]:
+        return await service().read_document(
+            ReadDocumentInput(
+                document_id=UUID(document_id),
+                cursor=cursor,
+                max_chars=max_chars,
+                max_chunks=max_chunks,
+                include_metadata=include_metadata,
+            )
+        )
+
+    @mcp.tool()
+    async def mouseion_document_outline(document_id: str) -> dict[str, Any]:
+        return await service().document_outline(
+            DocumentOutlineInput(document_id=UUID(document_id))
+        )
+
+    @mcp.tool()
+    async def mouseion_search_document(
+        document_id: str, query: str, top_k: int = 10
+    ) -> dict[str, Any]:
+        return await service().search_document(
+            SearchDocumentInput(document_id=UUID(document_id), query=query, top_k=top_k)
+        )
 
     @mcp.tool()
     async def mouseion_list(type: str = "all", limit: int = 50, offset: int = 0) -> dict[str, Any]:

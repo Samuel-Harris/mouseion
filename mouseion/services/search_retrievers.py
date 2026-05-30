@@ -302,6 +302,9 @@ def _sql_filter(filter: SearchFilter | None) -> SqlFilter:
     if filter.type is not None:
         clauses.append("d.type = ?")
         params.append(str(filter.type))
+    if filter.document_id is not None:
+        clauses.append("d.id = ?")
+        params.append(str(filter.document_id))
     for index, tag in enumerate(filter.tags or []):
         alias = f"filter_tag_{index}"
         clauses.append(
