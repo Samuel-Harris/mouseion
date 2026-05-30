@@ -34,19 +34,16 @@ from mouseion.ingest.embedder import Embedder
 from mouseion.services.bulk_ingest import (
     BatchIngestItem,
     BulkIngestService,
-    EdgePolicy,
 )
 from mouseion.services.factory import open_services
-from mouseion.services.graph import GraphService
-from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
-from mouseion.support.utils import canonical_text_hash
 
 DEFAULT_INPUT = Path("raw_data/raw-kaggle-arxiv-metadata-2026-05-29.json")
 DEFAULT_CATEGORIES_JSON = Path("utilities/arxiv/categories.json")
 KAGGLE_ARXIV_DOWNLOAD_URL = (
     "https://www.kaggle.com/datasets/Cornell-University/arxiv?resource=download"
 )
+CATEGORIES_FIELD_RE = re.compile(rb'"categories"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 class MissingInputFileError(FileNotFoundError):
@@ -97,7 +94,6 @@ class ImportOptions:
     batch_size: int = 100
     dry_run: bool = False
     progress_every: int = 1000
-    edge_policy: EdgePolicy = "recompute-after-insert"
 
 
 @dataclass(slots=True)
@@ -106,7 +102,6 @@ class PreparedPaper:
     source: str
     title: str
     content: str
-    content_hash: str
     tags: list[str]
     metadata: dict[str, Any]
     category_codes: list[str]
@@ -120,7 +115,6 @@ class ImportStats:
     updated: int = 0
     skipped: int = 0
     failed: int = 0
-    edges_created: int = 0
     unresolved_categories: Counter[str] = field(default_factory=Counter[str])
     elapsed_seconds: float = 0.0
 
@@ -131,7 +125,6 @@ class ImportStats:
             "updated": self.updated,
             "skipped": self.skipped,
             "failed": self.failed,
-            "edges_created": self.edges_created,
             "unresolved_categories": dict(sorted(self.unresolved_categories.items())),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
         }
@@ -235,7 +228,6 @@ def prepare_record(
         source=f"arxiv:{arxiv_id}",
         title=title,
         content=content,
-        content_hash=canonical_text_hash(content),
         tags=tags,
         metadata=metadata,
         category_codes=category_codes,
@@ -256,11 +248,15 @@ async def import_arxiv_metadata(
     catalog = load_category_catalog(options.categories_json)
     requested_groups = {slugify(group) for group in options.groups}
     requested_categories = {category.lower() for category in options.categories}
+    requested_filter_categories = category_filter_codes(
+        catalog,
+        requested_groups=requested_groups,
+        requested_categories=requested_categories,
+    )
     import_timestamp = datetime.now(tz=UTC).isoformat(timespec="seconds")
     import_source = str(options.input)
 
     dry_store: SQLiteStore | None = None
-    service: MouseionService | None = None
     bulk_ingest: BulkIngestService | None = None
     active_embedder = embedder
     progress = create_progress() if options.progress_every > 0 else None
@@ -278,7 +274,6 @@ async def import_arxiv_metadata(
                     dry_store,
                     Chunker(settings),
                     dry_embedder,
-                    GraphService(dry_store, settings),
                 )
         else:
             active_embedder = active_embedder or Embedder(settings)
@@ -286,7 +281,6 @@ async def import_arxiv_metadata(
             services = await stack.enter_async_context(
                 open_services(settings, embedder=active_embedder)
             )
-            service = services.service
             bulk_ingest = services.bulk_ingest
 
         batch: list[PreparedPaper] = []
@@ -316,6 +310,11 @@ async def import_arxiv_metadata(
                         break
                     line = line.strip()
                     if not line:
+                        stats.skipped += 1
+                        continue
+                    if requested_filter_categories and not raw_categories_match_filter(
+                        line, requested_filter_categories
+                    ):
                         stats.skipped += 1
                         continue
                     try:
@@ -354,11 +353,9 @@ async def import_arxiv_metadata(
                     if len(batch) >= options.batch_size:
                         await flush_batch(
                             bulk_ingest=bulk_ingest,
-                            service=service,
                             dry_run=options.dry_run,
                             batch=batch,
                             stats=stats,
-                            edge_policy=_batch_edge_policy(options.edge_policy),
                         )
                         batch = []
                         update_progress(
@@ -374,11 +371,9 @@ async def import_arxiv_metadata(
             if batch:
                 await flush_batch(
                     bulk_ingest=bulk_ingest,
-                    service=service,
                     dry_run=options.dry_run,
                     batch=batch,
                     stats=stats,
-                    edge_policy=_batch_edge_policy(options.edge_policy),
                 )
             if pending_bytes:
                 update_progress(
@@ -394,14 +389,6 @@ async def import_arxiv_metadata(
                     pending_bytes=0,
                     stats=stats,
                 )
-            if (
-                service is not None
-                and options.edge_policy == "recompute-after-insert"
-                and stats.inserted + stats.updated > 0
-            ):
-                recompute = await service.recompute_edges()
-                stats.edges_created = int(recompute["edges_created"])
-
     stats.elapsed_seconds = time.monotonic() - start
     return stats
 
@@ -409,11 +396,9 @@ async def import_arxiv_metadata(
 async def flush_batch(
     *,
     bulk_ingest: BulkIngestService | None,
-    service: MouseionService | None,
     dry_run: bool,
     batch: list[PreparedPaper],
     stats: ImportStats,
-    edge_policy: EdgePolicy,
 ) -> None:
     items = [paper_to_batch_item(paper) for paper in batch]
     if dry_run:
@@ -430,20 +415,18 @@ async def flush_batch(
         stats.skipped += int(output["skipped"])
         return
 
-    if bulk_ingest is None or service is None:
+    if bulk_ingest is None:
         raise RuntimeError("import batch requires open Mouseion services")
 
     try:
         output = await bulk_ingest.ingest(
             items,
-            edge_policy=edge_policy,
             skip_unchanged=True,
             metadata_compare_exclude={"import_timestamp"},
         )
         stats.inserted += int(output["inserted"])
         stats.updated += int(output["updated"])
         stats.skipped += int(output["skipped"])
-        stats.edges_created += int(output["edges_created"])
     except EmbeddingError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -476,12 +459,6 @@ def paper_to_batch_item(paper: PreparedPaper) -> BatchIngestItem:
     )
 
 
-def _batch_edge_policy(edge_policy: EdgePolicy) -> EdgePolicy:
-    if edge_policy == "recompute-after-insert":
-        return "skip"
-    return edge_policy
-
-
 def selected_by_filters(
     paper: PreparedPaper,
     catalog: CategoryCatalog,
@@ -495,6 +472,44 @@ def selected_by_filters(
     category_match = bool(record_categories & requested_categories)
     group_match = catalog.group_matches(requested_groups, paper.category_codes)
     return category_match or group_match
+
+
+def category_filter_codes(
+    catalog: CategoryCatalog,
+    *,
+    requested_groups: set[str],
+    requested_categories: set[str],
+) -> set[str]:
+    if not requested_groups and not requested_categories:
+        return set()
+    return requested_categories | {
+        code for code, entry in catalog.categories.items() if entry.group_slug in requested_groups
+    }
+
+
+def raw_categories_match_filter(line: bytes, requested_categories: set[str]) -> bool:
+    raw_categories = extract_raw_categories(line)
+    if raw_categories is None:
+        return False
+    return any(code.lower() in requested_categories for code in raw_categories.split())
+
+
+def extract_raw_categories(line: bytes) -> str | None:
+    match = CATEGORIES_FIELD_RE.search(line)
+    if match is None:
+        return None
+
+    raw_value = match.group(1)
+    if b"\\" not in raw_value:
+        return raw_value.decode("utf-8", errors="replace")
+
+    try:
+        loaded: object = json.loads(b'"' + raw_value + b'"')
+    except json.JSONDecodeError:
+        return None
+    if isinstance(loaded, str):
+        return loaded
+    return None
 
 
 def normalize_text(value: str) -> str:
@@ -563,12 +578,6 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--progress-every", type=int, default=1000)
-    parser.add_argument(
-        "--edge-policy",
-        choices=("skip", "incremental", "recompute-after-insert"),
-        default="recompute-after-insert",
-        help="How to create similarity graph edges after bulk ingest.",
-    )
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
@@ -587,7 +596,6 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
         batch_size=args.batch_size,
         dry_run=args.dry_run,
         progress_every=args.progress_every,
-        edge_policy=args.edge_policy,
     )
 
 

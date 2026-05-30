@@ -261,7 +261,6 @@ $("search-form").addEventListener("submit", async (event) => {
     const body = {
       query: $("search-input").value,
       top_k: Number($("search-top-k").value),
-      include_graph_neighbours: $("search-neighbours").checked,
       search_syntax: $("search-advanced").checked ? "advanced" : "plain",
     };
     const type = $("search-type").value;

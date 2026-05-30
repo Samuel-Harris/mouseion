@@ -10,15 +10,14 @@ from typing import Any, TypeVar, cast
 from uuid import UUID, uuid4
 
 import apsw
-import sqlite_vec
 from anyio.to_thread import run_sync
 
 from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
+from mouseion.storage.vector import SQLiteVectorBackend, VectorRuntimeConfig
 from mouseion.support.utils import json_dumps, json_loads
 
-SCHEMA_VERSION = "2"
-EMBEDDING_DIMS = 768
+SCHEMA_VERSION = "3"
 T = TypeVar("T")
 
 
@@ -67,6 +66,7 @@ class DocumentChunkUpsertResult:
 class SQLiteStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.vector_backend = SQLiteVectorBackend(settings)
         self.database: apsw.Connection | None = None
         self._write_lock = asyncio.Lock()
 
@@ -85,14 +85,14 @@ class SQLiteStore:
             else apsw.SQLITE_OPEN_READWRITE | apsw.SQLITE_OPEN_CREATE
         )
         conn = apsw.Connection(str(self.settings.sqlite_path), flags=flags)
-        conn.enableloadextension(True)
-        sqlite_vec.load(conn)
-        conn.enableloadextension(False)
+        self.vector_backend.load_extension(conn)
         if not readonly:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        if readonly:
+            self.vector_backend.initialize_if_present_sync(conn)
         self.database = conn
 
     async def close(self) -> None:
@@ -134,8 +134,16 @@ class SQLiteStore:
         def run(conn: apsw.Connection) -> None:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
-            self._ensure_meta_sync(conn, "schema_version", SCHEMA_VERSION)
-            self._ensure_meta_sync(conn, "last_recompute_at", "")
+            conn.execute("DELETE FROM meta WHERE key = ?", ("last_recompute_at",))
+            self.vector_backend.ensure_bootstrap_meta_sync(conn)
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("schema_version", SCHEMA_VERSION),
+            )
+            self.vector_backend.initialize_sync(conn)
             _backfill_search_fts(conn)
 
         await self.write(run)
@@ -161,6 +169,32 @@ class SQLiteStore:
             )
 
         await self.write(run)
+
+    async def vector_runtime_config(self) -> VectorRuntimeConfig:
+        return await self.vector_backend.runtime_config(self.execute)
+
+    async def vector_status(self) -> dict[str, Any]:
+        return await self.vector_backend.status(self.execute)
+
+    async def vector_quantize_memory(self, qbits: int) -> int:
+        return await self.vector_backend.quantize_memory(self.execute, qbits)
+
+    async def set_vector_mode_exact(self) -> dict[str, Any]:
+        return await self.vector_backend.set_mode_exact(self.write, self.execute)
+
+    async def set_vector_mode_quantized(self, qbits: int) -> dict[str, Any]:
+        return await self.vector_backend.set_mode_quantized(self.write, self.execute, qbits)
+
+    async def quantize_vectors(self, *, qbits: int, preload: bool = False) -> dict[str, Any]:
+        return await self.vector_backend.quantize(
+            self.write,
+            self.execute,
+            qbits=qbits,
+            preload=preload,
+        )
+
+    async def cleanup_quantized_vectors(self) -> dict[str, Any]:
+        return await self.vector_backend.cleanup(self.write, self.execute)
 
     async def find_document_for_ingest(
         self, doc_type: DocumentType, source: str, content_hash: str
@@ -337,6 +371,8 @@ class SQLiteStore:
                 _upsert_document_row(conn, document_id_text, document, now_timestamp)
                 _insert_document_tags(conn, document_id_text, document.tags)
                 _insert_document_chunks(conn, document_id_text, document, now_timestamp)
+                if exists or document.chunks:
+                    self.vector_backend.mark_dirty_sync(conn)
                 results.append(
                     DocumentChunkUpsertResult(
                         document_id=document_id,
@@ -350,8 +386,8 @@ class SQLiteStore:
 
         return await self.write(run)
 
-    async def delete_document(self, document_id: UUID) -> tuple[int, int]:
-        def run(conn: apsw.Connection) -> tuple[int, int]:
+    async def delete_document(self, document_id: UUID) -> int:
+        def run(conn: apsw.Connection) -> int:
             chunk_ids = [
                 int(row["id"])
                 for row in _rows_from_cursor(
@@ -360,28 +396,13 @@ class SQLiteStore:
                     (str(document_id),),
                 )
             ]
-            related_edges = _count(
-                conn,
-                "SELECT count(*) FROM related_to WHERE from_doc = ? OR to_doc = ?",
-                (str(document_id), str(document_id)),
-            )
-            similar_edges = 0
-            if chunk_ids:
-                placeholders = ",".join("?" for _ in chunk_ids)
-                similar_edges = _count(
-                    conn,
-                    f"""
-                    SELECT count(*)
-                    FROM similar_to
-                    WHERE from_chunk IN ({placeholders}) OR to_chunk IN ({placeholders})
-                    """,
-                    (*chunk_ids, *chunk_ids),
-                )
             conn.execute("DELETE FROM documents WHERE id = ?", (str(document_id),))
-            return len(chunk_ids), len(chunk_ids) + related_edges + similar_edges
+            if chunk_ids:
+                self.vector_backend.mark_dirty_sync(conn)
+            return len(chunk_ids)
 
         deleted = await self.write(run)
-        return (int(deleted[0]), int(deleted[1]))
+        return int(deleted)
 
 
 SCHEMA_STATEMENTS = [
@@ -428,10 +449,10 @@ SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_chunk_doc ON chunks(document_id)",
-    f"""
-    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
-      chunk_id INTEGER PRIMARY KEY,
-      embedding FLOAT[{EMBEDDING_DIMS}] distance_metric=cosine
+    """
+    CREATE TABLE IF NOT EXISTS chunk_vectors(
+      chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+      embedding BLOB NOT NULL
     )
     """,
     """
@@ -476,27 +497,6 @@ SCHEMA_STATEMENTS = [
       DELETE FROM search_fts WHERE rowid = old.id;
     END
     """,
-    """
-    CREATE TABLE IF NOT EXISTS similar_to(
-      from_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-      to_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-      score REAL,
-      CHECK(from_chunk < to_chunk),
-      PRIMARY KEY(from_chunk, to_chunk)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_sim_from ON similar_to(from_chunk)",
-    "CREATE INDEX IF NOT EXISTS idx_sim_to ON similar_to(to_chunk)",
-    """
-    CREATE TABLE IF NOT EXISTS related_to(
-      from_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      to_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      label TEXT DEFAULT '',
-      note TEXT,
-      created_at TEXT,
-      PRIMARY KEY(from_doc, to_doc, label)
-    )
-    """,
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
 ]
 
@@ -520,13 +520,6 @@ def _fetch_one(
 ) -> dict[str, Any] | None:
     rows = _rows_from_cursor(conn.cursor(), query, parameters)
     return rows[0] if rows else None
-
-
-def _count(conn: apsw.Connection, query: str, parameters: tuple[Any, ...] = ()) -> int:
-    row = _fetch_one(conn, query, parameters)
-    if not row:
-        return 0
-    return int(next(iter(row.values())))
 
 
 def _batched[T](items: list[T], size: int) -> list[list[T]]:

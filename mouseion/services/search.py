@@ -7,6 +7,8 @@ from typing import Any
 from mouseion.domain.models import SearchFilter
 from mouseion.ingest.embedder import Embedder
 from mouseion.storage.db import SQLiteStore, chunk_from_row, document_from_row, embedding_blob
+from mouseion.storage.vector import VECTOR_COLUMN, VECTOR_TABLE, vector_scan_function
+from mouseion.support.logging_config import get_logger
 
 
 @dataclass(slots=True)
@@ -45,7 +47,6 @@ class SearchService:
         query: str,
         *,
         top_k: int,
-        include_graph_neighbours: bool = False,
         filter: SearchFilter | None = None,
         search_syntax: str = "plain",
     ) -> dict[str, Any]:
@@ -57,6 +58,10 @@ class SearchService:
         query_vector = await self.embedder.embed(query)
         vec_hits = await self._vector_hits(query_vector, fusion_k, filter)
         fused = hybrid_fuse(fts_hits, vec_hits, top_k=top_k)
+        vector_config = await self.store.vector_runtime_config()
+        warnings: list[str] = []
+        if vector_config.warning is not None:
+            warnings.append(vector_config.warning)
         results: list[dict[str, Any]] = []
         for hit in fused:
             hydrated = await self._hydrate_chunk(hit.chunk_id)
@@ -64,35 +69,48 @@ class SearchService:
                 continue
             hydrated["score"] = hit.score
             hydrated["match"] = hit.match
-            if include_graph_neighbours:
-                hydrated["graph_neighbours"] = await self.expand_similar_to(hit.chunk_id, cap=3)
             results.append(hydrated)
         output: dict[str, Any] = {"results": results}
         if not results:
             output["message"] = "No confident results."
+        if warnings:
+            output["warnings"] = warnings
         return output
 
     async def _vector_hits(
         self, query_vector: list[float], limit: int, filter: SearchFilter | None
     ) -> list[RankedHit]:
         sql_filter = _sql_filter(filter)
-        search_window = await self._vector_search_window(limit, sql_filter)
-        if search_window == 0:
-            return []
-        result = await self.store.execute(
-            f"""
-            SELECT v.chunk_id,
-                   v.distance
-            FROM chunk_vectors v
-            JOIN chunks c ON c.id = v.chunk_id
-            JOIN documents d ON d.id = c.document_id
-            WHERE embedding MATCH ? AND k = ?
-            {sql_filter.clause}
-            ORDER BY distance
-            LIMIT ?
-            """,
-            (embedding_blob(query_vector), search_window, *sql_filter.params, limit),
-        )
+        vector_config = await self.store.vector_runtime_config()
+        if vector_config.warning is not None:
+            get_logger(__name__).warning("vector_quantization_stale", message=vector_config.warning)
+        scan_function = vector_scan_function(vector_config.active_mode)
+        query_blob = embedding_blob(query_vector)
+        if sql_filter.active:
+            result = await self.store.execute(
+                f"""
+                SELECT v.rowid AS chunk_id,
+                       v.distance
+                FROM {scan_function}('{VECTOR_TABLE}', '{VECTOR_COLUMN}', ?) AS v
+                JOIN chunks c ON c.id = v.rowid
+                JOIN documents d ON d.id = c.document_id
+                WHERE 1 = 1
+                {sql_filter.clause}
+                ORDER BY v.distance
+                LIMIT ?
+                """,
+                (query_blob, *sql_filter.params, limit),
+            )
+        else:
+            result = await self.store.execute(
+                f"""
+                SELECT v.rowid AS chunk_id,
+                       v.distance
+                FROM {scan_function}('{VECTOR_TABLE}', '{VECTOR_COLUMN}', ?, ?) AS v
+                ORDER BY v.distance
+                """,
+                (query_blob, limit),
+            )
         return [
             RankedHit(
                 chunk_id=int(row["chunk_id"]),
@@ -181,13 +199,6 @@ class SearchService:
                 return hits
         return []
 
-    async def _vector_search_window(self, limit: int, sql_filter: SqlFilter) -> int:
-        if not sql_filter.active:
-            return limit * 4
-        result = await self.store.execute("SELECT count(*) AS total FROM chunk_vectors")
-        row = result.first()
-        return int(row["total"] if row else 0)
-
     async def _hydrate_chunk(self, chunk_id: int) -> dict[str, Any] | None:
         result = await self.store.execute(
             """
@@ -232,62 +243,6 @@ class SearchService:
             "token_count": chunk.token_count,
             "document": document.model_dump(mode="json"),
         }
-
-    async def expand_similar_to(self, chunk_id: int, cap: int) -> list[dict[str, Any]]:
-        result = await self.store.execute(
-            """
-            SELECT n.id AS "c.id",
-                   n.document_id AS "c.document_id",
-                   n.content AS "c.content",
-                   n.chunk_index AS "c.chunk_index",
-                   n.token_count AS "c.token_count",
-                   n.created_at AS "c.created_at",
-                   v.embedding AS "c.embedding",
-                   d.id,
-                   d.type,
-                   d.title,
-                   d.source,
-                   d.content_hash,
-                   d.created_at,
-                   d.updated_at,
-                   d.metadata,
-                   COALESCE(
-                     (
-                       SELECT json_group_array(tag)
-                       FROM (SELECT tag FROM tags WHERE document_id = d.id ORDER BY tag)
-                     ),
-                     '[]'
-                   ) AS tags,
-                   links.score
-            FROM (
-              SELECT CASE WHEN from_chunk = ? THEN to_chunk ELSE from_chunk END AS other_id,
-                     score
-              FROM similar_to
-              WHERE from_chunk = ? OR to_chunk = ?
-            ) links
-            JOIN chunks n ON n.id = links.other_id
-            JOIN documents d ON d.id = n.document_id
-            LEFT JOIN chunk_vectors v ON v.chunk_id = n.id
-            ORDER BY links.score DESC
-            LIMIT ?
-            """,
-            (chunk_id, chunk_id, chunk_id, cap),
-        )
-        neighbours: list[dict[str, Any]] = []
-        for row in result.rows:
-            document = document_from_row(row)
-            chunk = chunk_from_row(row)
-            neighbours.append(
-                {
-                    "chunk_id": str(chunk.id),
-                    "content": chunk.content,
-                    "chunk_index": chunk.chunk_index,
-                    "score": float(row.get("score", 0.0)),
-                    "document": document.model_dump(mode="json"),
-                }
-            )
-        return neighbours
-
 
 def rrf_fuse(hit_lists: list[list[RankedHit]], k: int) -> list[tuple[int, float]]:
     scores: dict[int, float] = {}

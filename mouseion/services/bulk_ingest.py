@@ -15,11 +15,9 @@ from mouseion.domain.models import (
 )
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.embedder import Embedder
-from mouseion.services.graph import GraphService
 from mouseion.storage.db import DocumentChunkUpsert, SQLiteStore
 from mouseion.support.utils import canonical_text_hash
 
-EdgePolicy = Literal["skip", "incremental", "recompute-after-insert"]
 _BatchAction = Literal["created", "replaced"]
 JsonDict = dict[str, Any]
 
@@ -40,7 +38,6 @@ class BulkIngestService:
     store: SQLiteStore
     chunker: Chunker
     embedder: Embedder
-    graph: GraphService
 
     async def preview(
         self,
@@ -55,27 +52,21 @@ class BulkIngestService:
             metadata_compare_exclude=metadata_compare_exclude or set(),
         )
         return _batch_ingest_output(
-            edge_policy="skip",
             documents=[_planned_document_output(item, 0) for item in plan.writable]
             + plan.skipped_documents,
             inserted=sum(1 for item in plan.writable if item.action == "created"),
             updated=sum(1 for item in plan.writable if item.action == "replaced"),
             skipped=len(plan.skipped_documents),
             chunks_created=0,
-            edges_created=0,
         )
 
     async def ingest(
         self,
         items: list[BatchIngestItem],
         *,
-        edge_policy: EdgePolicy = "incremental",
         skip_unchanged: bool = False,
         metadata_compare_exclude: set[str] | None = None,
     ) -> JsonDict:
-        if edge_policy not in {"skip", "incremental", "recompute-after-insert"}:
-            raise ValueError(f"Unsupported edge policy: {edge_policy}")
-
         plan = await self._plan(
             items,
             skip_unchanged=skip_unchanged,
@@ -83,13 +74,11 @@ class BulkIngestService:
         )
         if not plan.writable:
             return _batch_ingest_output(
-                edge_policy=edge_policy,
                 documents=plan.skipped_documents,
                 inserted=0,
                 updated=0,
                 skipped=len(plan.skipped_documents),
                 chunks_created=0,
-                edges_created=0,
             )
 
         upserts = await self._prepare_upserts(plan.writable)
@@ -106,22 +95,12 @@ class BulkIngestService:
         ]
         document_outputs.extend(plan.skipped_documents)
 
-        edges_created = 0
-        if edge_policy == "incremental":
-            for result in upsert_results:
-                edges_created += await self.graph.create_incremental_edges(result.document_id)
-        elif edge_policy == "recompute-after-insert":
-            recompute = await self.graph.recompute_all()
-            edges_created = int(recompute["edges_created"])
-
         return _batch_ingest_output(
-            edge_policy=edge_policy,
             documents=document_outputs,
             inserted=sum(1 for result in upsert_results if result.action == "created"),
             updated=sum(1 for result in upsert_results if result.action == "replaced"),
             skipped=len(plan.skipped_documents),
             chunks_created=sum(result.chunks_created for result in upsert_results),
-            edges_created=edges_created,
         )
 
     async def _plan(
@@ -268,21 +247,17 @@ def _planned_document_output(item: _PreparedBatchItem, chunks_created: int) -> J
 
 def _batch_ingest_output(
     *,
-    edge_policy: EdgePolicy,
     documents: list[JsonDict],
     inserted: int,
     updated: int,
     skipped: int,
     chunks_created: int,
-    edges_created: int,
 ) -> JsonDict:
     return {
         "status": "ok",
-        "edge_policy": edge_policy,
         "documents": documents,
         "inserted": inserted,
         "updated": updated,
         "skipped": skipped,
         "chunks_created": chunks_created,
-        "edges_created": edges_created,
     }

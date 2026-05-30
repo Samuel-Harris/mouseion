@@ -13,11 +13,17 @@ from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
 from mouseion.services.exporter import Exporter
-from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
-from utilities.arxiv.import_arxiv_metadata import ImportOptions, async_main, import_arxiv_metadata
+from utilities.arxiv.import_arxiv_metadata import (
+    ImportOptions,
+    async_main,
+    category_filter_codes,
+    import_arxiv_metadata,
+    load_category_catalog,
+    raw_categories_match_filter,
+)
 
 
 class FakeEmbedder:
@@ -173,7 +179,6 @@ async def imported_service(
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
         SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
-        GraphService(store, settings),
         RepoService(settings),
         Exporter(settings, store),
     )
@@ -344,16 +349,6 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     assert category_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
 
 
-async def test_metadata_importer_recomputes_edges_by_default(
-    imported_service: tuple[SQLiteStore, MouseionService, Settings],
-) -> None:
-    store, _, _ = imported_service
-
-    similar_edges = await store.execute("SELECT count(*) AS total FROM similar_to")
-
-    assert int(similar_edges.first()["total"]) == 1  # type: ignore[index]
-
-
 async def test_import_batches_embeddings_and_writes_one_chunk_per_paper(
     tmp_path: Path, categories_json: Path, arxiv_jsonl: Path
 ) -> None:
@@ -516,6 +511,32 @@ async def test_group_and_category_filters_use_union_semantics(
     )
 
     assert stats.selected == 2
+
+
+def test_category_filter_codes_expand_requested_groups(categories_json: Path) -> None:
+    catalog = load_category_catalog(categories_json)
+
+    codes = category_filter_codes(
+        catalog,
+        requested_groups={"computer-science"},
+        requested_categories={"stat.ml"},
+    )
+
+    assert codes == {"cs.ai", "cs.cg", "stat.ml"}
+
+
+def test_raw_category_prefilter_matches_exact_codes_case_insensitively() -> None:
+    line = b'{"id":"1234.0001","categories":"cs.AI stat.ML","title":"Paper"}'
+
+    assert raw_categories_match_filter(line, {"cs.ai"})
+    assert raw_categories_match_filter(line, {"stat.ml"})
+    assert not raw_categories_match_filter(line, {"cs.a"})
+
+
+def test_raw_category_prefilter_handles_escaped_values() -> None:
+    line = b'{"id":"1234.0001","categories":"cs.AI\\u0020stat.ML","title":"Paper"}'
+
+    assert raw_categories_match_filter(line, {"stat.ml"})
 
 
 async def test_unknown_categories_are_imported_and_reported(

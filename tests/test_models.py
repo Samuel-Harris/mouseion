@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from uuid import UUID, uuid4
-
 import pytest
 
 from mouseion.domain.models import SearchFilter, normalize_tags
 from mouseion.services.search import RankedHit, rrf_fuse
-from mouseion.support.utils import canonical_text_hash, deterministic_edge_id
+from mouseion.support.utils import canonical_text_hash
 
 
 def test_normalize_tags_deduplicates_and_lowercases() -> None:
@@ -30,14 +28,6 @@ def test_rrf_fuse_combines_rank_sources() -> None:
         k=60,
     )
     assert fused[0][0] == 2
-
-
-def test_deterministic_edge_id_is_stable() -> None:
-    left = uuid4()
-    right = uuid4()
-    edge_id = deterministic_edge_id(left, right, "related")
-    assert edge_id == deterministic_edge_id(left, right, "related")
-    assert isinstance(edge_id, UUID)
 
 
 def test_search_filter_rejects_unknown_type() -> None:

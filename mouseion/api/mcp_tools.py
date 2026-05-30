@@ -13,7 +13,6 @@ from mouseion.domain.models import (
     DeleteInput,
     GetDocumentInput,
     ListInput,
-    RelateInput,
     SearchFilter,
     SearchInput,
 )
@@ -53,7 +52,6 @@ def build_mcp(
     async def mouseion_search(
         query: str,
         top_k: int = 10,
-        include_graph_neighbours: bool = False,
         filter: dict[str, Any] | None = None,
         search_syntax: str = "plain",
     ) -> dict[str, Any]:
@@ -65,7 +63,6 @@ def build_mcp(
             SearchInput(
                 query=query,
                 top_k=top_k,
-                include_graph_neighbours=include_graph_neighbours,
                 filter=parsed_filter,
                 search_syntax=parsed_syntax,
             )
@@ -82,20 +79,8 @@ def build_mcp(
         )
 
     @mcp.tool()
-    async def mouseion_relate(
-        from_id: str, to_id: str, label: str | None = None, note: str | None = None
-    ) -> dict[str, Any]:
-        return await service().relate(
-            RelateInput(from_id=UUID(from_id), to_id=UUID(to_id), label=label, note=note)
-        )
-
-    @mcp.tool()
     async def mouseion_delete(id: str) -> dict[str, Any]:
         return await service().delete(DeleteInput(id=UUID(id)))
-
-    @mcp.tool()
-    async def mouseion_recompute_edges() -> dict[str, Any]:
-        return await service().recompute_edges()
 
     @mcp.tool()
     async def mouseion_export() -> dict[str, Any]:
