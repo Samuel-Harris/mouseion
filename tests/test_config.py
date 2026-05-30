@@ -16,6 +16,10 @@ def test_settings_defaults(tmp_path: Path) -> None:
     assert settings.mouseion_host == "127.0.0.1"
     assert settings.mouseion_mcp_description is None
     assert settings.sqlite_path == tmp_path / "data" / "mouseion.db"
+    assert settings.vector_search_mode == "exact"
+    assert settings.vector_quantization_qbits == 4
+    assert settings.vector_quantize_preload is False
+    assert settings.vector_quantize_max_memory == "30MB"
     assert settings.is_loopback_host()
 
 
@@ -52,3 +56,28 @@ def test_non_loopback_host_detection(tmp_path: Path) -> None:
         MOUSEION_HOST="0.0.0.0",
     )
     assert not settings.is_loopback_host()
+
+
+def test_vector_settings_validate_mode_and_qbits(tmp_path: Path) -> None:
+    settings = Settings(
+        MOUSEION_DATA_DIR=tmp_path / "data",
+        MOUSEION_REPOS_DIR=tmp_path / "repos",
+        MOUSEION_VECTOR_SEARCH_MODE="QUANTIZED",
+        MOUSEION_VECTOR_QUANTIZATION_QBITS=2,
+        MOUSEION_VECTOR_QUANTIZE_PRELOAD=True,
+        MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY=" 50mb ",
+    )
+
+    assert settings.vector_search_mode == "quantized"
+    assert settings.vector_quantization_qbits == 2
+    assert settings.vector_quantize_preload is True
+    assert settings.vector_quantize_max_memory == "50MB"
+
+
+def test_vector_settings_reject_invalid_qbits(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        Settings(
+            MOUSEION_DATA_DIR=tmp_path / "data",
+            MOUSEION_REPOS_DIR=tmp_path / "repos",
+            MOUSEION_VECTOR_QUANTIZATION_QBITS=8,
+        )

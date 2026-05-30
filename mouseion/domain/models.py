@@ -41,13 +41,6 @@ class Chunk(BaseModel):
     created_at: datetime
 
 
-class RelatedDocument(BaseModel):
-    document: Document
-    label: str | None = None
-    note: str | None = None
-    created_at: datetime | None = None
-
-
 class SearchFilter(BaseModel):
     tags: list[str] | None = None
     type: DocumentType | None = None
@@ -98,7 +91,6 @@ class AddRepoInput(BaseModel):
 class SearchInput(BaseModel):
     query: str
     top_k: int = Field(default=10, ge=1, le=100)
-    include_graph_neighbours: bool = False
     filter: SearchFilter | None = None
 
 
@@ -110,13 +102,6 @@ class ListInput(BaseModel):
     type: Literal["document", "memory", "url", "all"] = "all"
     limit: int = Field(default=50, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
-
-
-class RelateInput(BaseModel):
-    from_id: UUID
-    to_id: UUID
-    label: str | None = None
-    note: str | None = None
 
 
 class DeleteInput(BaseModel):

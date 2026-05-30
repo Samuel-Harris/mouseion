@@ -13,7 +13,6 @@ from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
 from mouseion.services.exporter import Exporter
-from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
@@ -180,7 +179,6 @@ async def imported_service(
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
         SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
-        GraphService(store, settings),
         RepoService(settings),
         Exporter(settings, store),
     )
@@ -341,16 +339,6 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     )
     assert "Neural Symbolic Planning" in chunks.first()["content"]  # type: ignore[index]
     assert "zeta planning" in chunks.first()["content"]  # type: ignore[index]
-
-
-async def test_metadata_importer_recomputes_edges_by_default(
-    imported_service: tuple[SQLiteStore, MouseionService, Settings],
-) -> None:
-    store, _, _ = imported_service
-
-    similar_edges = await store.execute("SELECT count(*) AS total FROM similar_to")
-
-    assert int(similar_edges.first()["total"]) == 1  # type: ignore[index]
 
 
 async def test_import_batches_embeddings_and_writes_one_chunk_per_paper(

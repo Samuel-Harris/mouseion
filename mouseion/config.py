@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import cached_property
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,10 +28,19 @@ class Settings(BaseSettings):
     chunk_target_tokens: int = Field(default=512, alias="CHUNK_TARGET_TOKENS")
     chunk_max_tokens: int = Field(default=1024, alias="CHUNK_MAX_TOKENS")
     chunk_min_tokens: int = Field(default=100, alias="CHUNK_MIN_TOKENS")
-    similarity_threshold: float = Field(default=0.82, alias="SIMILARITY_THRESHOLD")
-    similarity_top_k: int = Field(default=10, alias="SIMILARITY_TOP_K")
-    similar_edge_recompute_hours: float = Field(default=24, alias="SIMILAR_EDGE_RECOMPUTE_HOURS")
     rrf_k: int = Field(default=60, alias="RRF_K")
+    vector_search_mode: Literal["exact", "quantized"] = Field(
+        default="exact", alias="MOUSEION_VECTOR_SEARCH_MODE"
+    )
+    vector_quantization_qbits: Literal[2, 3, 4] = Field(
+        default=4, alias="MOUSEION_VECTOR_QUANTIZATION_QBITS"
+    )
+    vector_quantize_preload: bool = Field(
+        default=False, alias="MOUSEION_VECTOR_QUANTIZE_PRELOAD"
+    )
+    vector_quantize_max_memory: str = Field(
+        default="30MB", alias="MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY"
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator("mouseion_data_dir", "mouseion_repos_dir", mode="before")
@@ -43,6 +52,21 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("vector_search_mode", mode="before")
+    @classmethod
+    def normalize_vector_search_mode(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("vector_quantize_max_memory", mode="before")
+    @classmethod
+    def normalize_vector_quantize_max_memory(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip().upper()
+        if not stripped:
+            raise ValueError("MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY must not be empty")
+        return stripped
 
     @field_validator("mouseion_mcp_description")
     @classmethod
@@ -62,10 +86,6 @@ class Settings(BaseSettings):
             raise ValueError("CHUNK_TARGET_TOKENS must be >= CHUNK_MIN_TOKENS")
         if self.chunk_max_tokens < self.chunk_target_tokens:
             raise ValueError("CHUNK_MAX_TOKENS must be >= CHUNK_TARGET_TOKENS")
-        if not (0 < self.similarity_threshold <= 1):
-            raise ValueError("SIMILARITY_THRESHOLD must be in (0, 1]")
-        if self.similarity_top_k < 1:
-            raise ValueError("SIMILARITY_TOP_K must be positive")
         if self.rrf_k < 1:
             raise ValueError("RRF_K must be positive")
         return self

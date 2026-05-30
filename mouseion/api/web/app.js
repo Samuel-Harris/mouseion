@@ -234,7 +234,6 @@ $("search-form").addEventListener("submit", async (event) => {
     const body = {
       query: $("search-input").value,
       top_k: 10,
-      include_graph_neighbours: $("search-neighbours").checked,
     };
     const result = await jsonFetch("/api/search", { method: "POST", body: JSON.stringify(body) });
     renderResults(result.results);
