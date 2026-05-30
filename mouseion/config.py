@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import cached_property
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     similarity_top_k: int = Field(default=10, alias="SIMILARITY_TOP_K")
     similar_edge_recompute_hours: float = Field(default=24, alias="SIMILAR_EDGE_RECOMPUTE_HOURS")
     rrf_k: int = Field(default=60, alias="RRF_K")
+    vector_search_mode: Literal["exact", "quantized"] = Field(
+        default="exact", alias="MOUSEION_VECTOR_SEARCH_MODE"
+    )
+    vector_quantization_qbits: Literal[2, 3, 4] = Field(
+        default=4, alias="MOUSEION_VECTOR_QUANTIZATION_QBITS"
+    )
+    vector_quantize_preload: bool = Field(
+        default=False, alias="MOUSEION_VECTOR_QUANTIZE_PRELOAD"
+    )
+    vector_quantize_max_memory: str = Field(
+        default="30MB", alias="MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY"
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @field_validator("mouseion_data_dir", "mouseion_repos_dir", mode="before")
@@ -43,6 +55,21 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper()
+
+    @field_validator("vector_search_mode", mode="before")
+    @classmethod
+    def normalize_vector_search_mode(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("vector_quantize_max_memory", mode="before")
+    @classmethod
+    def normalize_vector_quantize_max_memory(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip().upper()
+        if not stripped:
+            raise ValueError("MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY must not be empty")
+        return stripped
 
     @field_validator("mouseion_mcp_description")
     @classmethod

@@ -24,6 +24,16 @@ def test_mcp_route_is_exposed_without_double_prefix() -> None:
     assert not any(getattr(route, "path", None) == "/mcp/mcp" for route in app.routes)
 
 
+def test_vector_api_routes_are_exposed() -> None:
+    app = create_app()
+    paths = {getattr(route, "path", None) for route in app.routes}
+
+    assert "/api/vector/status" in paths
+    assert "/api/vector/mode" in paths
+    assert "/api/vector/quantize" in paths
+    assert "/api/vector/cleanup" in paths
+
+
 def test_mcp_endpoint_runs_inside_main_lifespan(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

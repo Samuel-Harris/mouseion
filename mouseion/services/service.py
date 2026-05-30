@@ -123,6 +123,24 @@ class MouseionService:
     async def recompute_edges(self) -> JsonDict:
         return await self.graph.recompute_all()
 
+    async def vector_status(self) -> JsonDict:
+        return await self.store.vector_status()
+
+    async def set_vector_mode(self, mode: str, qbits: int | None = None) -> JsonDict:
+        if mode == "exact":
+            return await self.store.set_vector_mode_exact()
+        if mode == "quantized":
+            return await self.store.set_vector_mode_quantized(
+                qbits or self.store.settings.vector_quantization_qbits
+            )
+        raise ValueError(f"Unsupported vector search mode: {mode}")
+
+    async def quantize_vectors(self, qbits: int, *, preload: bool = False) -> JsonDict:
+        return await self.store.quantize_vectors(qbits=qbits, preload=preload)
+
+    async def cleanup_quantized_vectors(self) -> JsonDict:
+        return await self.store.cleanup_quantized_vectors()
+
     async def export(self) -> JsonDict:
         return await self.exporter.export()
 

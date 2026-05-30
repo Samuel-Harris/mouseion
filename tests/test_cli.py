@@ -15,6 +15,7 @@ from mouseion.__main__ import (
     _model_names_match,
     _nuke_db,
     _recompute_edges,
+    _vector_command,
     build_parser,
 )
 from mouseion.config import Settings
@@ -58,6 +59,31 @@ def test_recompute_edges_parser() -> None:
     args = build_parser().parse_args(["recompute-edges"])
 
     assert args.command == "recompute-edges"
+
+
+def test_vector_status_parser() -> None:
+    args = build_parser().parse_args(["vector", "status"])
+
+    assert args.command == "vector"
+    assert args.vector_command == "status"
+
+
+def test_vector_mode_quantized_parser() -> None:
+    args = build_parser().parse_args(["vector", "mode", "quantized", "--qbits", "2"])
+
+    assert args.command == "vector"
+    assert args.vector_command == "mode"
+    assert args.mode == "quantized"
+    assert args.qbits == 2
+
+
+def test_vector_quantize_parser() -> None:
+    args = build_parser().parse_args(["vector", "quantize", "--qbits", "4", "--preload"])
+
+    assert args.command == "vector"
+    assert args.vector_command == "quantize"
+    assert args.qbits == 4
+    assert args.preload is True
 
 
 def test_parser_requires_command() -> None:
@@ -225,6 +251,70 @@ async def test_recompute_edges_handles_missing_local_database(
         "edges_created": 0,
         "duration_seconds": 0.0,
     }
+
+
+async def test_vector_status_falls_back_to_local_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    args = build_parser().parse_args(["vector", "status"])
+
+    def fake_mouseion_json(
+        base_url: str,
+        path: str,
+        *,
+        timeout: float = 10,
+        method: str = "GET",
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        raise URLError("daemon offline")
+
+    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
+
+    result = await _vector_command(settings, args)
+
+    assert result["source"] == "local database"
+    assert result["configured_mode"] == "exact"
+    assert result["effective_mode"] == "exact"
+    assert result["configured_qbits"] == 4
+
+
+async def test_vector_mode_uses_daemon_when_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    args = build_parser().parse_args(["vector", "mode", "quantized", "--qbits", "3"])
+
+    def fake_mouseion_json(
+        base_url: str,
+        path: str,
+        *,
+        timeout: float = 10,
+        method: str = "GET",
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        assert base_url == "http://127.0.0.1:7778"
+        assert path == "api/vector/mode"
+        assert method == "POST"
+        assert payload == {"mode": "quantized", "qbits": 3}
+        return {
+            "configured_mode": "quantized",
+            "effective_mode": "quantized",
+            "configured_qbits": 3,
+            "dirty": False,
+            "quantized_available": True,
+            "quantized_rows": 1,
+            "estimated_preload_memory": 0,
+            "warning": None,
+        }
+
+    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
+
+    result = await _vector_command(settings, args)
+
+    assert result["source"] == "daemon"
+    assert result["configured_mode"] == "quantized"
+    assert result["configured_qbits"] == 3
 
 
 def test_nuke_db_aborts_without_exact_confirmation(

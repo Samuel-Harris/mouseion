@@ -6,6 +6,7 @@ from typing import Any
 from mouseion.domain.models import SearchFilter
 from mouseion.ingest.embedder import Embedder
 from mouseion.storage.db import SQLiteStore, chunk_from_row, document_from_row, embedding_blob
+from mouseion.support.logging_config import get_logger
 
 
 @dataclass(slots=True)
@@ -44,6 +45,10 @@ class SearchService:
         vec_hits = await self._vector_hits(query_vector, fusion_k, filter)
         fts_hits = await self._fts_hits(query, fusion_k, filter)
         fused = rrf_fuse([vec_hits, fts_hits], self.rrf_k)[:top_k]
+        vector_config = await self.store.vector_runtime_config()
+        warnings: list[str] = []
+        if vector_config.warning is not None:
+            warnings.append(vector_config.warning)
         results: list[dict[str, Any]] = []
         for chunk_id, score in fused:
             hydrated = await self._hydrate_chunk(chunk_id)
@@ -53,29 +58,49 @@ class SearchService:
             if include_graph_neighbours:
                 hydrated["graph_neighbours"] = await self.expand_similar_to(chunk_id, cap=3)
             results.append(hydrated)
-        return {"results": results}
+        output: dict[str, Any] = {"results": results}
+        if warnings:
+            output["warnings"] = warnings
+        return output
 
     async def _vector_hits(
         self, query_vector: list[float], limit: int, filter: SearchFilter | None
     ) -> list[RankedHit]:
         sql_filter = _sql_filter(filter)
-        search_window = await self._vector_search_window(limit, sql_filter)
-        if search_window == 0:
-            return []
-        result = await self.store.execute(
-            f"""
-            SELECT v.chunk_id,
-                   v.distance
-            FROM chunk_vectors v
-            JOIN chunks c ON c.id = v.chunk_id
-            JOIN documents d ON d.id = c.document_id
-            WHERE embedding MATCH ? AND k = ?
-            {sql_filter.clause}
-            ORDER BY distance
-            LIMIT ?
-            """,
-            (embedding_blob(query_vector), search_window, *sql_filter.params, limit),
+        vector_config = await self.store.vector_runtime_config()
+        if vector_config.warning is not None:
+            get_logger(__name__).warning("vector_quantization_stale", message=vector_config.warning)
+        scan_function = (
+            "vector_quantize_scan"
+            if vector_config.active_mode == "quantized"
+            else "vector_full_scan"
         )
+        query_blob = embedding_blob(query_vector)
+        if sql_filter.active:
+            result = await self.store.execute(
+                f"""
+                SELECT v.rowid AS chunk_id,
+                       v.distance
+                FROM {scan_function}('chunk_vectors', 'embedding', ?) AS v
+                JOIN chunks c ON c.id = v.rowid
+                JOIN documents d ON d.id = c.document_id
+                WHERE 1 = 1
+                {sql_filter.clause}
+                ORDER BY v.distance
+                LIMIT ?
+                """,
+                (query_blob, *sql_filter.params, limit),
+            )
+        else:
+            result = await self.store.execute(
+                f"""
+                SELECT v.rowid AS chunk_id,
+                       v.distance
+                FROM {scan_function}('chunk_vectors', 'embedding', ?, ?) AS v
+                ORDER BY v.distance
+                """,
+                (query_blob, limit),
+            )
         return [
             RankedHit(
                 chunk_id=int(row["chunk_id"]),
@@ -107,13 +132,6 @@ class SearchService:
             RankedHit(chunk_id=int(row["chunk_id"]), score=float(row["score"]), rank=index + 1)
             for index, row in enumerate(result.rows)
         ]
-
-    async def _vector_search_window(self, limit: int, sql_filter: SqlFilter) -> int:
-        if not sql_filter.active:
-            return limit * 4
-        result = await self.store.execute("SELECT count(*) AS total FROM chunk_vectors")
-        row = result.first()
-        return int(row["total"] if row else 0)
 
     async def _hydrate_chunk(self, chunk_id: int) -> dict[str, Any] | None:
         result = await self.store.execute(

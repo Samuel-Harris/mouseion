@@ -11,6 +11,7 @@ import structlog.contextvars
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from mouseion.api.mcp_tools import build_mcp
 from mouseion.api.tasks import BackgroundTasks
@@ -32,6 +33,16 @@ from mouseion.services.service import MouseionService
 from mouseion.support.logging_config import configure_logging, get_logger
 
 JsonDict = dict[str, Any]
+
+
+class VectorModeInput(BaseModel):
+    mode: str = Field(pattern="^(exact|quantized)$")
+    qbits: int | None = Field(default=None, ge=2, le=4)
+
+
+class VectorQuantizeInput(BaseModel):
+    qbits: int = Field(ge=2, le=4)
+    preload: bool = False
 
 
 def create_app() -> FastAPI:
@@ -146,6 +157,26 @@ def create_app() -> FastAPI:
     @app.post("/api/recompute_edges")
     async def api_recompute_edges(request: Request) -> JsonDict:
         return await _service(request).recompute_edges()
+
+    @app.get("/api/vector/status")
+    async def api_vector_status(request: Request) -> JsonDict:
+        return await _service(request).vector_status()
+
+    @app.post("/api/vector/mode")
+    async def api_vector_mode(input: VectorModeInput, request: Request) -> JsonDict:
+        if input.qbits is not None and input.qbits not in {2, 3, 4}:
+            raise HTTPException(status_code=422, detail="qbits must be one of 2, 3, or 4")
+        return await _service(request).set_vector_mode(input.mode, input.qbits)
+
+    @app.post("/api/vector/quantize")
+    async def api_vector_quantize(input: VectorQuantizeInput, request: Request) -> JsonDict:
+        if input.qbits not in {2, 3, 4}:
+            raise HTTPException(status_code=422, detail="qbits must be one of 2, 3, or 4")
+        return await _service(request).quantize_vectors(input.qbits, preload=input.preload)
+
+    @app.post("/api/vector/cleanup")
+    async def api_vector_cleanup(request: Request) -> JsonDict:
+        return await _service(request).cleanup_quantized_vectors()
 
     @app.post("/api/files")
     async def api_add_file(

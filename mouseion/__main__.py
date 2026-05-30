@@ -41,6 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("status", help="Show daemon status and database summary stats")
     subparsers.add_parser("recompute-edges", help="Recompute similar_to graph edges")
+    vector = subparsers.add_parser("vector", help="Manage SQLite vector search mode")
+    vector_subparsers = vector.add_subparsers(dest="vector_command", required=True)
+    vector_subparsers.add_parser("status", help="Show vector backend status")
+    vector_mode = vector_subparsers.add_parser("mode", help="Switch vector search mode")
+    vector_mode_subparsers = vector_mode.add_subparsers(dest="mode", required=True)
+    vector_mode_subparsers.add_parser("exact", help="Use exact full-scan vector search")
+    quantized_mode = vector_mode_subparsers.add_parser(
+        "quantized", help="Quantize vectors and use TurboQuant search"
+    )
+    quantized_mode.add_argument("--qbits", type=int, choices=[2, 3, 4], default=None)
+    vector_quantize = vector_subparsers.add_parser(
+        "quantize", help="Rebuild TurboQuant data without changing search mode"
+    )
+    vector_quantize.add_argument("--qbits", type=int, choices=[2, 3, 4], required=True)
+    vector_quantize.add_argument("--preload", action="store_true", help="Preload quantized data")
+    vector_subparsers.add_parser("cleanup", help="Remove TurboQuant data")
     nuke_db = subparsers.add_parser("nuke-db", help="Delete the mouseion SQLite database")
     nuke_db.add_argument(
         "-y",
@@ -73,6 +89,8 @@ def main() -> None:
         _print_status(_collect_status(settings))
     elif args.command == "recompute-edges":
         _print_recompute_edges(asyncio.run(_recompute_edges(settings)))
+    elif args.command == "vector":
+        _print_vector_result(asyncio.run(_vector_command(settings, args)))
     elif args.command == "nuke-db":
         _nuke_db(settings, assume_yes=args.yes)
 
@@ -104,12 +122,106 @@ async def _recompute_edges(settings: Settings) -> JsonDict:
         return {"source": "local database", **result}
 
 
+async def _vector_command(settings: Settings, args: argparse.Namespace) -> JsonDict:
+    command = str(args.vector_command)
+    if command == "status":
+        return await _vector_daemon_or_local(settings, "api/vector/status")
+    if command == "mode":
+        mode = str(args.mode)
+        payload: JsonDict = {"mode": mode}
+        if mode == "quantized" and args.qbits is not None:
+            payload["qbits"] = int(args.qbits)
+        return await _vector_daemon_or_local(
+            settings, "api/vector/mode", method="POST", payload=payload
+        )
+    if command == "quantize":
+        return await _vector_daemon_or_local(
+            settings,
+            "api/vector/quantize",
+            method="POST",
+            payload={"qbits": int(args.qbits), "preload": bool(args.preload)},
+        )
+    if command == "cleanup":
+        return await _vector_daemon_or_local(settings, "api/vector/cleanup", method="POST")
+    raise ValueError(f"Unsupported vector command: {command}")
+
+
+async def _vector_daemon_or_local(
+    settings: Settings,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: JsonDict | None = None,
+) -> JsonDict:
+    daemon_url = _mouseion_base_url(settings)
+    try:
+        result = _mouseion_json(
+            daemon_url,
+            path,
+            payload=payload,
+            method=method,
+            timeout=STATUS_TIMEOUT_SECONDS,
+        )
+        return {"source": "daemon", **result}
+    except (OSError, URLError, TimeoutError, json.JSONDecodeError):
+        store = SQLiteStore(settings)
+        await store.open()
+        try:
+            if path == "api/vector/status":
+                result = await store.vector_status()
+            elif path == "api/vector/mode":
+                if payload is None:
+                    raise ValueError("Vector mode command requires a payload")
+                mode = str(payload.get("mode", ""))
+                if mode == "exact":
+                    result = await store.set_vector_mode_exact()
+                elif mode == "quantized":
+                    qbits_value = payload.get("qbits")
+                    qbits = (
+                        int(qbits_value)
+                        if qbits_value is not None
+                        else settings.vector_quantization_qbits
+                    )
+                    result = await store.set_vector_mode_quantized(qbits)
+                else:
+                    raise ValueError(f"Unsupported vector mode: {mode}")
+            elif path == "api/vector/quantize":
+                if payload is None:
+                    raise ValueError("Vector quantize command requires a payload")
+                result = await store.quantize_vectors(
+                    qbits=int(payload["qbits"]),
+                    preload=bool(payload.get("preload", False)),
+                )
+            elif path == "api/vector/cleanup":
+                result = await store.cleanup_quantized_vectors()
+            else:
+                raise ValueError(f"Unsupported vector API path: {path}")
+        finally:
+            await store.close()
+        return {"source": "local database", **result}
+
+
 def _print_recompute_edges(result: JsonDict) -> None:
     print("Mouseion edge recompute")
     print(f"Source: {result['source']}")
     print(f"Chunks processed: {int(result.get('chunks_processed', 0))}")
     print(f"Edges created: {int(result.get('edges_created', 0))}")
     print(f"Duration seconds: {float(result.get('duration_seconds', 0.0)):.3f}")
+
+
+def _print_vector_result(result: JsonDict) -> None:
+    print("Mouseion vector")
+    print(f"Source: {result['source']}")
+    print(f"Configured mode: {result.get('configured_mode', 'exact')}")
+    print(f"Effective mode: {result.get('effective_mode', 'exact')}")
+    print(f"Configured qbits: {int(result.get('configured_qbits', 4))}")
+    print(f"Dirty: {'yes' if result.get('dirty', True) else 'no'}")
+    print(f"Quantized available: {'yes' if result.get('quantized_available', False) else 'no'}")
+    print(f"Quantized rows: {int(result.get('quantized_rows', 0))}")
+    print(f"Estimated preload memory bytes: {int(result.get('estimated_preload_memory', 0))}")
+    warning = result.get("warning")
+    if warning:
+        print(f"Warning: {warning}")
 
 
 def _collect_status(settings: Settings) -> JsonDict:
@@ -161,9 +273,24 @@ def _mouseion_base_url(settings: Settings) -> str:
 
 
 def _mouseion_json(
-    base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
+    base_url: str,
+    path: str,
+    *,
+    timeout: float = 10,
+    method: str = "GET",
+    payload: JsonDict | None = None,
 ) -> dict[str, Any]:
-    request = Request(urljoin(base_url.rstrip("/") + "/", path), method=method)
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        urljoin(base_url.rstrip("/") + "/", path),
+        data=data,
+        headers=headers,
+        method=method,
+    )
     with urlopen(request, timeout=timeout) as response:
         return cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
 

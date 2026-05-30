@@ -709,6 +709,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "rich" },
     { name = "sqlite-vec" },
+    { name = "sqliteai-vector" },
     { name = "structlog" },
     { name = "tiktoken" },
     { name = "trafilatura" },
@@ -739,6 +740,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
+    { name = "sqliteai-vector", specifier = ">=1.0.0" },
     { name = "structlog", specifier = ">=25.1.0" },
     { name = "tiktoken", specifier = ">=0.9.0" },
     { name = "trafilatura", specifier = ">=2.0.0" },
@@ -1366,6 +1368,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/00/d4/f2b936d3bdc38eadcbd2a87875815db36430fab0363182ba5d12cd8e0b51/sqlite_vec-0.1.9-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4e921e592f24a5f9a18f590b6ddd530eb637e2d474e3b1972f9bbeb773aa3cb9", size = 160076, upload-time = "2026-03-31T08:02:33.796Z" },
     { url = "https://files.pythonhosted.org/packages/6f/ad/6afd073b0f817b3e03f9e37ad626ae341805891f23c74b5292818f49ac63/sqlite_vec-0.1.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux1_x86_64.whl", hash = "sha256:1515727990b49e79bcaf75fdee2ffc7d461f8b66905013231251f1c8938e7786", size = 163388, upload-time = "2026-03-31T08:02:34.888Z" },
     { url = "https://files.pythonhosted.org/packages/42/89/81b2907cda14e566b9bf215e2ad82fc9b349edf07d2010756ffdb902f328/sqlite_vec-0.1.9-py3-none-win_amd64.whl", hash = "sha256:4a28dc12fa4b53d7b1dced22da2488fade444e96b5d16fd2d698cd670675cf32", size = 292804, upload-time = "2026-03-31T08:02:36.035Z" },
+]
+
+[[package]]
+name = "sqliteai-vector"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2b/40/77ea9053e9538d097d71ce944e7fe9f356648e5acf39adc3983b01be9287/sqliteai_vector-1.0.0-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:e6724447b32e00342cab3ee67734c918d87ab2caa336a458f48dd4fe05830f9d", size = 144141, upload-time = "2026-05-25T14:22:10.029Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/6c/800d73d53b77d6dae6b11796ae8ce6bce6d5745b851900157b56a85a3e89/sqliteai_vector-1.0.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:5f52dede7372e67b9f219bd2163e4fd246eb867debee5f4ad825bab998a08812", size = 144136, upload-time = "2026-05-25T14:22:13.585Z" },
+    { url = "https://files.pythonhosted.org/packages/62/1e/ac1bbd2f444b8b3fb3dd72b798cd52003c3ab2b80420049868a5280496af/sqliteai_vector-1.0.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:f9428101b02f633a7e1dde766edcf979827a97ec4ff113d3cd060739297e68fc", size = 67543, upload-time = "2026-05-25T14:22:11.683Z" },
+    { url = "https://files.pythonhosted.org/packages/10/fa/c8c067b3a430351e828e686afd70a1ab736ddb73a01236d3e3ab3566fa5d/sqliteai_vector-1.0.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:108c56a3b11d36fd5b807b9d08169f10ba763cbabc569a7f0029c09d43ca066b", size = 83527, upload-time = "2026-05-25T14:22:11.548Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/00/ddce58f23164d65fd166f60e545120a7124ea38be33c23e67589251e7b28/sqliteai_vector-1.0.0-py3-none-win_amd64.whl", hash = "sha256:80eeddcbd7e41bd99c9e267de8aee6fdc04452d49a7168537bc7416059747900", size = 85343, upload-time = "2026-05-25T14:22:20.418Z" },
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 # Mouseion
 
-Mouseion is a local-first personal knowledge base. It runs as a single Python daemon, stores documents and chunks in SQLite with `sqlite-vec` and FTS5, embeds chunks through local Ollama, and exposes retrieval/admin operations through HTTP MCP tools plus a small web UI.
+Mouseion is a local-first personal knowledge base. It runs as a single Python daemon, stores documents and chunks in SQLite with `sqlite-vector` and FTS5, embeds chunks through local Ollama, and exposes retrieval/admin operations through HTTP MCP tools plus a small web UI.
 
 ## Name
 
@@ -12,7 +12,7 @@ This project borrows the name for the same basic idea at a personal scale: a loc
 
 - Python 3.13
 - uv
-- SQLite via APSW, with `sqlite-vec` for vector search
+- SQLite via APSW, with `sqlite-vector` for vector search
 - Ollama running locally with `nomic-embed-text`
 
 Install dependencies:
@@ -55,6 +55,18 @@ Recompute `similar_to` graph edges after bulk imports:
 uv run mouseion recompute-edges
 ```
 
+Manage the vector backend:
+
+```bash
+uv run mouseion vector status
+uv run mouseion vector mode exact
+uv run mouseion vector mode quantized --qbits 4
+uv run mouseion vector quantize --qbits 4 --preload
+uv run mouseion vector cleanup
+```
+
+Exact full-scan vector search is the default. TurboQuant search is opt-in with `qbits` set to `2`, `3`, or `4`; `sqlite-vec` remains installed only so legacy `vec0` databases can be migrated automatically on open.
+
 ## Configuration
 
 Settings are loaded from `.env` and environment variables:
@@ -75,6 +87,10 @@ Settings are loaded from `.env` and environment variables:
 | `SIMILARITY_TOP_K`             | `10`                     |
 | `SIMILAR_EDGE_RECOMPUTE_HOURS` | `24`                     |
 | `RRF_K`                        | `60`                     |
+| `MOUSEION_VECTOR_SEARCH_MODE`   | `exact`                  |
+| `MOUSEION_VECTOR_QUANTIZATION_QBITS` | `4`                |
+| `MOUSEION_VECTOR_QUANTIZE_PRELOAD` | `false`              |
+| `MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY` | `30MB`            |
 | `LOG_LEVEL`                    | `INFO`                   |
 
 `data/` and cloned repos under `repos/` are intentionally gitignored. `data/mouseion.db` is the source of truth for mouseion content; include `mouseion.db`, `mouseion.db-wal`, and `mouseion.db-shm` when making a file-level backup. Use `mouseion_export` for a markdown dump.
