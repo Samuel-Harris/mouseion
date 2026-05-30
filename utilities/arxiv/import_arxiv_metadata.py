@@ -34,11 +34,8 @@ from mouseion.ingest.embedder import Embedder
 from mouseion.services.bulk_ingest import (
     BatchIngestItem,
     BulkIngestService,
-    EdgePolicy,
 )
 from mouseion.services.factory import open_services
-from mouseion.services.graph import GraphService
-from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
 
 DEFAULT_INPUT = Path("raw_data/raw-kaggle-arxiv-metadata-2026-05-29.json")
@@ -97,7 +94,6 @@ class ImportOptions:
     batch_size: int = 100
     dry_run: bool = False
     progress_every: int = 1000
-    edge_policy: EdgePolicy = "recompute-after-insert"
 
 
 @dataclass(slots=True)
@@ -119,7 +115,6 @@ class ImportStats:
     updated: int = 0
     skipped: int = 0
     failed: int = 0
-    edges_created: int = 0
     unresolved_categories: Counter[str] = field(default_factory=Counter[str])
     elapsed_seconds: float = 0.0
 
@@ -130,7 +125,6 @@ class ImportStats:
             "updated": self.updated,
             "skipped": self.skipped,
             "failed": self.failed,
-            "edges_created": self.edges_created,
             "unresolved_categories": dict(sorted(self.unresolved_categories.items())),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
         }
@@ -263,7 +257,6 @@ async def import_arxiv_metadata(
     import_source = str(options.input)
 
     dry_store: SQLiteStore | None = None
-    service: MouseionService | None = None
     bulk_ingest: BulkIngestService | None = None
     active_embedder = embedder
     progress = create_progress() if options.progress_every > 0 else None
@@ -281,7 +274,6 @@ async def import_arxiv_metadata(
                     dry_store,
                     Chunker(settings),
                     dry_embedder,
-                    GraphService(dry_store, settings),
                 )
         else:
             active_embedder = active_embedder or Embedder(settings)
@@ -289,7 +281,6 @@ async def import_arxiv_metadata(
             services = await stack.enter_async_context(
                 open_services(settings, embedder=active_embedder)
             )
-            service = services.service
             bulk_ingest = services.bulk_ingest
 
         batch: list[PreparedPaper] = []
@@ -362,11 +353,9 @@ async def import_arxiv_metadata(
                     if len(batch) >= options.batch_size:
                         await flush_batch(
                             bulk_ingest=bulk_ingest,
-                            service=service,
                             dry_run=options.dry_run,
                             batch=batch,
                             stats=stats,
-                            edge_policy=_batch_edge_policy(options.edge_policy),
                         )
                         batch = []
                         update_progress(
@@ -382,11 +371,9 @@ async def import_arxiv_metadata(
             if batch:
                 await flush_batch(
                     bulk_ingest=bulk_ingest,
-                    service=service,
                     dry_run=options.dry_run,
                     batch=batch,
                     stats=stats,
-                    edge_policy=_batch_edge_policy(options.edge_policy),
                 )
             if pending_bytes:
                 update_progress(
@@ -402,14 +389,6 @@ async def import_arxiv_metadata(
                     pending_bytes=0,
                     stats=stats,
                 )
-            if (
-                service is not None
-                and options.edge_policy == "recompute-after-insert"
-                and stats.inserted + stats.updated > 0
-            ):
-                recompute = await service.recompute_edges()
-                stats.edges_created = int(recompute["edges_created"])
-
     stats.elapsed_seconds = time.monotonic() - start
     return stats
 
@@ -417,11 +396,9 @@ async def import_arxiv_metadata(
 async def flush_batch(
     *,
     bulk_ingest: BulkIngestService | None,
-    service: MouseionService | None,
     dry_run: bool,
     batch: list[PreparedPaper],
     stats: ImportStats,
-    edge_policy: EdgePolicy,
 ) -> None:
     items = [paper_to_batch_item(paper) for paper in batch]
     if dry_run:
@@ -438,20 +415,18 @@ async def flush_batch(
         stats.skipped += int(output["skipped"])
         return
 
-    if bulk_ingest is None or service is None:
+    if bulk_ingest is None:
         raise RuntimeError("import batch requires open Mouseion services")
 
     try:
         output = await bulk_ingest.ingest(
             items,
-            edge_policy=edge_policy,
             skip_unchanged=True,
             metadata_compare_exclude={"import_timestamp"},
         )
         stats.inserted += int(output["inserted"])
         stats.updated += int(output["updated"])
         stats.skipped += int(output["skipped"])
-        stats.edges_created += int(output["edges_created"])
     except EmbeddingError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -482,12 +457,6 @@ def paper_to_batch_item(paper: PreparedPaper) -> BatchIngestItem:
         tags=paper.tags,
         chunks=[ChunkText(content=paper.content, token_count=estimate_token_count(paper.content))],
     )
-
-
-def _batch_edge_policy(edge_policy: EdgePolicy) -> EdgePolicy:
-    if edge_policy == "recompute-after-insert":
-        return "skip"
-    return edge_policy
 
 
 def selected_by_filters(
@@ -609,12 +578,6 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--progress-every", type=int, default=1000)
-    parser.add_argument(
-        "--edge-policy",
-        choices=("skip", "incremental", "recompute-after-insert"),
-        default="recompute-after-insert",
-        help="How to create similarity graph edges after bulk ingest.",
-    )
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
@@ -633,7 +596,6 @@ def parse_args(argv: list[str] | None = None) -> ImportOptions:
         batch_size=args.batch_size,
         dry_run=args.dry_run,
         progress_every=args.progress_every,
-        edge_policy=args.edge_policy,
     )
 
 

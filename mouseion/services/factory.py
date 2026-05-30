@@ -12,7 +12,6 @@ from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
 from mouseion.services.bulk_ingest import BulkIngestService
 from mouseion.services.exporter import Exporter
-from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore
@@ -36,21 +35,19 @@ async def open_services(
     try:
         active_embedder = embedder or Embedder(active_settings)
         chunker = Chunker(active_settings)
-        graph = GraphService(store, active_settings)
         service = MouseionService(
             store=store,
             ingestor=Ingestor(active_settings),
             chunker=chunker,
             embedder=active_embedder,
             searcher=SearchService(store, active_embedder, active_settings.rrf_k),
-            graph=graph,
             repos=RepoService(active_settings),
             exporter=Exporter(active_settings, store),
         )
         yield ServiceBundle(
             store=store,
             service=service,
-            bulk_ingest=BulkIngestService(store, chunker, active_embedder, graph),
+            bulk_ingest=BulkIngestService(store, chunker, active_embedder),
         )
     finally:
         await store.close()

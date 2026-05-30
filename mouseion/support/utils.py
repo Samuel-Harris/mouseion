@@ -6,9 +6,6 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID, uuid5
-
-EDGE_NAMESPACE = UUID("a14746c0-0ed7-55bf-a95d-dc320fa22d08")
 
 
 def canonical_text_hash(text: str) -> str:
@@ -35,10 +32,6 @@ def json_loads(value: str | None) -> dict[str, Any]:
     if isinstance(loaded, dict):
         return cast(dict[str, Any], loaded)
     return {"value": loaded}
-
-
-def deterministic_edge_id(from_id: UUID, to_id: UUID, label: str | None) -> UUID:
-    return uuid5(EDGE_NAMESPACE, f"{from_id}:{to_id}:{label or ''}")
 
 
 def timestamp_for_path(value: datetime) -> str:

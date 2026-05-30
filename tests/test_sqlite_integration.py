@@ -17,7 +17,6 @@ from mouseion.domain.models import (
     GetDocumentInput,
     IngestedContent,
     ListInput,
-    RelateInput,
     SearchFilter,
     SearchInput,
 )
@@ -26,7 +25,6 @@ from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
 from mouseion.services.bulk_ingest import BatchIngestItem, BulkIngestService
 from mouseion.services.exporter import Exporter
-from mouseion.services.graph import GraphService
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore, embedding_blob
@@ -50,14 +48,12 @@ async def mouseion_service(tmp_path: Path) -> AsyncIterator[tuple[SQLiteStore, M
     store = SQLiteStore(settings)
     await store.open()
     embedder = FakeEmbedder()
-    graph = GraphService(store, settings)
     service = MouseionService(
         store,
         Ingestor(settings),
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
         SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
-        graph,
         RepoService(settings),
         Exporter(settings, store),
     )
@@ -129,20 +125,58 @@ async def test_fresh_database_uses_sqlite_vector_blob_table(tmp_path: Path) -> N
         await store.close()
 
 
-async def test_memory_replacement_preserves_related_edges(
+async def test_fresh_database_does_not_create_graph_tables(tmp_path: Path) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        tables = await store.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name IN ('similar_to', 'related_to')
+            """
+        )
+    finally:
+        await store.close()
+
+    assert tables.rows == []
+
+
+async def test_opening_existing_database_drops_graph_tables(tmp_path: Path) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    settings.ensure_directories()
+    conn = apsw.Connection(str(settings.sqlite_path))
+    try:
+        conn.execute("CREATE TABLE similar_to(from_chunk INTEGER, to_chunk INTEGER)")
+        conn.execute("CREATE TABLE related_to(from_doc TEXT, to_doc TEXT)")
+        conn.execute("INSERT INTO similar_to(from_chunk, to_chunk) VALUES(1, 2)")
+        conn.execute("INSERT INTO related_to(from_doc, to_doc) VALUES('1', '2')")
+    finally:
+        conn.close()
+
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        tables = await store.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name IN ('similar_to', 'related_to')
+            """
+        )
+    finally:
+        await store.close()
+
+    assert tables.rows == []
+
+
+async def test_memory_replacement_preserves_document_identity(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     _, service = mouseion_service
     first = await service.add_memory(
         AddMemoryInput(content="Stable memory one for replacement.", tags=["old"])
-    )
-    second = await service.add_memory(AddMemoryInput(content="Stable memory two.", tags=["other"]))
-    await service.relate(
-        RelateInput(
-            from_id=UUID(first["memory_id"]),
-            to_id=UUID(second["memory_id"]),
-            label="related",
-        )
     )
 
     replacement = await service.add_memory(
@@ -153,7 +187,7 @@ async def test_memory_replacement_preserves_related_edges(
     )
 
     assert replacement["memory_id"] == first["memory_id"]
-    assert len(document["related_documents"]) == 1
+    assert "related_documents" not in document
     assert document["document"]["tags"] == ["new"]
 
 
@@ -330,30 +364,12 @@ async def test_vector_cleanup_marks_quantized_data_unavailable(
     assert "falling back to exact" in str(status["warning"])
 
 
-async def test_similarity_edges_are_stored_once_as_canonical_pairs(
-    mouseion_service: tuple[SQLiteStore, MouseionService],
-) -> None:
-    store, service = mouseion_service
-    await service.add_memory(AddMemoryInput(content="first similarity document", tags=[]))
-    await service.add_memory(AddMemoryInput(content="second similarity document", tags=[]))
-
-    recompute = await service.recompute_edges()
-    rows = (await store.execute("SELECT from_chunk, to_chunk FROM similar_to")).rows
-
-    assert recompute["edges_created"] == 1
-    assert rows == [{"from_chunk": 1, "to_chunk": 2}]
-
-
-async def test_service_stats_include_documents_chunks_and_edges(
+async def test_service_stats_include_documents_chunks_tags_and_types(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     _, service = mouseion_service
-    first = await service.add_memory(AddMemoryInput(content="first stats document", tags=["stats"]))
-    second = await service.add_memory(AddMemoryInput(content="second stats document", tags=[]))
-    await service.relate(
-        RelateInput(from_id=UUID(first["memory_id"]), to_id=UUID(second["memory_id"]))
-    )
-    await service.recompute_edges()
+    await service.add_memory(AddMemoryInput(content="first stats document", tags=["stats"]))
+    await service.add_memory(AddMemoryInput(content="second stats document", tags=[]))
 
     stats = await service.stats()
 
@@ -361,14 +377,14 @@ async def test_service_stats_include_documents_chunks_and_edges(
     assert stats["documents_by_type"] == {"memory": 2}
     assert stats["chunks"] == 2
     assert stats["tags"] == 1
-    assert stats["edges"] == {"total": 2, "related": 1, "similar": 1}
+    assert "edges" not in stats
 
 
-async def test_batch_ingest_batches_embeddings_and_can_skip_edges(
+async def test_batch_ingest_batches_embeddings(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
-    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder)
     embedder = service.embedder  # type: ignore[assignment]
     embedder.calls = []  # type: ignore[attr-defined]
 
@@ -376,25 +392,23 @@ async def test_batch_ingest_batches_embeddings_and_can_skip_edges(
         [
             _batch_item("batch:one", "First batch document exactphrase", tags=["bulk"]),
             _batch_item("batch:two", "Second batch document otherphrase", tags=["bulk"]),
-        ],
-        edge_policy="skip",
+        ]
     )
-    similar_edges = await store.execute("SELECT count(*) AS total FROM similar_to")
 
     assert output["inserted"] == 2
     assert output["updated"] == 0
-    assert output["edges_created"] == 0
+    assert "edges_created" not in output
+    assert "edge_policy" not in output
     assert embedder.calls == [  # type: ignore[attr-defined]
         ["First batch document exactphrase", "Second batch document otherphrase"]
     ]
-    assert int(similar_edges.first()["total"]) == 0  # type: ignore[index]
 
 
 async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
-    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder)
 
     preview = await bulk_ingest.preview(
         [
@@ -406,8 +420,7 @@ async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
         [
             _batch_item("batch:dupe", "First duplicate batch document"),
             _batch_item("batch:dupe", "Second duplicate batch document"),
-        ],
-        edge_policy="skip",
+        ]
     )
     documents = await store.execute(
         "SELECT count(*) AS total FROM documents WHERE type = ? AND source = ?",
@@ -431,37 +444,17 @@ async def test_batch_ingest_enforces_source_identity_inside_write_transaction(
     assert chunks.rows == [{"content": "Second duplicate batch document"}]
 
 
-async def test_batch_ingest_recomputes_edges_after_insert(
-    mouseion_service: tuple[SQLiteStore, MouseionService],
-) -> None:
-    store, service = mouseion_service
-    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
-
-    output = await bulk_ingest.ingest(
-        [
-            _batch_item("batch:one", "First recompute batch document"),
-            _batch_item("batch:two", "Second recompute batch document"),
-        ],
-        edge_policy="recompute-after-insert",
-    )
-    similar_edges = await store.execute("SELECT count(*) AS total FROM similar_to")
-
-    assert output["inserted"] == 2
-    assert output["edges_created"] == 1
-    assert int(similar_edges.first()["total"]) == 1  # type: ignore[index]
-
-
 async def test_batch_ingest_skips_unchanged_documents_without_embedding(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
-    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder, service.graph)
+    bulk_ingest = BulkIngestService(store, service.chunker, service.embedder)
     item = _batch_item("batch:stable", "Stable unchanged batch document")
-    await bulk_ingest.ingest([item], edge_policy="skip")
+    await bulk_ingest.ingest([item])
     embedder = service.embedder  # type: ignore[assignment]
     embedder.calls = []  # type: ignore[attr-defined]
 
-    output = await bulk_ingest.ingest([item], edge_policy="skip", skip_unchanged=True)
+    output = await bulk_ingest.ingest([item], skip_unchanged=True)
 
     assert output["inserted"] == 0
     assert output["updated"] == 0
@@ -469,7 +462,7 @@ async def test_batch_ingest_skips_unchanged_documents_without_embedding(
     assert embedder.calls == []  # type: ignore[attr-defined]
 
 
-async def test_delete_cascades_chunks_fts_vectors_and_edges(
+async def test_delete_cascades_chunks_fts_and_vectors(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
     store, service = mouseion_service
@@ -486,7 +479,6 @@ async def test_delete_cascades_chunks_fts_vectors_and_edges(
         "chunks": "SELECT count(*) AS total FROM chunks",
         "fts": "SELECT count(*) AS total FROM chunks_fts",
         "vectors": "SELECT count(*) AS total FROM chunk_vectors",
-        "similar_to": "SELECT count(*) AS total FROM similar_to",
     }
     for query in counts.values():
         result = await store.execute(query)
@@ -505,4 +497,3 @@ def _batch_item(source: str, content: str, tags: list[str] | None = None) -> Bat
         tags=tags or [],
         chunks=[ChunkText(content=content, token_count=len(content.split()))],
     )
-

@@ -37,7 +37,6 @@ class SearchService:
         query: str,
         *,
         top_k: int,
-        include_graph_neighbours: bool = False,
         filter: SearchFilter | None = None,
     ) -> dict[str, Any]:
         query_vector = await self.embedder.embed(query)
@@ -55,8 +54,6 @@ class SearchService:
             if hydrated is None:
                 continue
             hydrated["score"] = score
-            if include_graph_neighbours:
-                hydrated["graph_neighbours"] = await self.expand_similar_to(chunk_id, cap=3)
             results.append(hydrated)
         output: dict[str, Any] = {"results": results}
         if warnings:
@@ -177,62 +174,6 @@ class SearchService:
             "token_count": chunk.token_count,
             "document": document.model_dump(mode="json"),
         }
-
-    async def expand_similar_to(self, chunk_id: int, cap: int) -> list[dict[str, Any]]:
-        result = await self.store.execute(
-            """
-            SELECT n.id AS "c.id",
-                   n.document_id AS "c.document_id",
-                   n.content AS "c.content",
-                   n.chunk_index AS "c.chunk_index",
-                   n.token_count AS "c.token_count",
-                   n.created_at AS "c.created_at",
-                   v.embedding AS "c.embedding",
-                   d.id,
-                   d.type,
-                   d.title,
-                   d.source,
-                   d.content_hash,
-                   d.created_at,
-                   d.updated_at,
-                   d.metadata,
-                   COALESCE(
-                     (
-                       SELECT json_group_array(tag)
-                       FROM (SELECT tag FROM tags WHERE document_id = d.id ORDER BY tag)
-                     ),
-                     '[]'
-                   ) AS tags,
-                   links.score
-            FROM (
-              SELECT CASE WHEN from_chunk = ? THEN to_chunk ELSE from_chunk END AS other_id,
-                     score
-              FROM similar_to
-              WHERE from_chunk = ? OR to_chunk = ?
-            ) links
-            JOIN chunks n ON n.id = links.other_id
-            JOIN documents d ON d.id = n.document_id
-            LEFT JOIN chunk_vectors v ON v.chunk_id = n.id
-            ORDER BY links.score DESC
-            LIMIT ?
-            """,
-            (chunk_id, chunk_id, chunk_id, cap),
-        )
-        neighbours: list[dict[str, Any]] = []
-        for row in result.rows:
-            document = document_from_row(row)
-            chunk = chunk_from_row(row)
-            neighbours.append(
-                {
-                    "chunk_id": str(chunk.id),
-                    "content": chunk.content,
-                    "chunk_index": chunk.chunk_index,
-                    "score": float(row.get("score", 0.0)),
-                    "document": document.model_dump(mode="json"),
-                }
-            )
-        return neighbours
-
 
 def rrf_fuse(hit_lists: list[list[RankedHit]], k: int) -> list[tuple[int, float]]:
     scores: dict[int, float] = {}

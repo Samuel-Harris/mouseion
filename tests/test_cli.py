@@ -14,7 +14,6 @@ from mouseion.__main__ import (
     _ensure_ollama_model,
     _model_names_match,
     _nuke_db,
-    _recompute_edges,
     _vector_command,
     build_parser,
 )
@@ -53,12 +52,6 @@ def test_status_parser() -> None:
     args = build_parser().parse_args(["status"])
 
     assert args.command == "status"
-
-
-def test_recompute_edges_parser() -> None:
-    args = build_parser().parse_args(["recompute-edges"])
-
-    assert args.command == "recompute-edges"
 
 
 def test_vector_status_parser() -> None:
@@ -151,7 +144,6 @@ def test_status_uses_daemon_stats_when_running(
             "documents": 3,
             "chunks": 12,
             "tags": 4,
-            "edges": {"total": 5, "related": 2, "similar": 3},
             "documents_by_type": {"file": 1, "memory": 2},
         }
 
@@ -162,7 +154,7 @@ def test_status_uses_daemon_stats_when_running(
     assert status["running"] is True
     assert status["stats_source"] == "daemon"
     assert status["stats"]["documents"] == 3
-    assert status["stats"]["edges"] == {"total": 5, "related": 2, "similar": 3}
+    assert "edges" not in status["stats"]
 
 
 def test_status_falls_back_to_local_database_when_daemon_is_offline(
@@ -185,7 +177,7 @@ def test_status_falls_back_to_local_database_when_daemon_is_offline(
     assert status["stats"]["documents_by_type"] == {"memory": 1, "url": 1}
     assert status["stats"]["chunks"] == 3
     assert status["stats"]["tags"] == 2
-    assert status["stats"]["edges"] == {"total": 3, "related": 1, "similar": 2}
+    assert "edges" not in status["stats"]
 
 
 def test_status_handles_missing_local_database(
@@ -203,54 +195,7 @@ def test_status_handles_missing_local_database(
     assert status["running"] is False
     assert status["stats_source"] == "local database (not found)"
     assert status["stats"]["documents"] == 0
-    assert status["stats"]["edges"] == {"total": 0, "related": 0, "similar": 0}
-
-
-async def test_recompute_edges_uses_daemon_when_running(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
-
-    def fake_mouseion_json(
-        base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
-    ) -> dict[str, object]:
-        assert base_url == "http://127.0.0.1:7778"
-        assert path == "api/recompute_edges"
-        assert method == "POST"
-        return {"chunks_processed": 2, "edges_created": 1, "duration_seconds": 0.5}
-
-    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
-
-    result = await _recompute_edges(settings)
-
-    assert result == {
-        "source": "daemon",
-        "chunks_processed": 2,
-        "edges_created": 1,
-        "duration_seconds": 0.5,
-    }
-
-
-async def test_recompute_edges_handles_missing_local_database(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
-
-    def fake_mouseion_json(
-        base_url: str, path: str, *, timeout: float = 10, method: str = "GET"
-    ) -> dict[str, object]:
-        raise URLError("daemon offline")
-
-    monkeypatch.setattr("mouseion.__main__._mouseion_json", fake_mouseion_json)
-
-    result = await _recompute_edges(settings)
-
-    assert result == {
-        "source": "local database (not found)",
-        "chunks_processed": 0,
-        "edges_created": 0,
-        "duration_seconds": 0.0,
-    }
+    assert "edges" not in status["stats"]
 
 
 async def test_vector_status_falls_back_to_local_database(
@@ -371,12 +316,8 @@ def _create_status_test_database(path: Path) -> None:
         conn.execute("CREATE TABLE documents(id TEXT PRIMARY KEY, type TEXT)")
         conn.execute("CREATE TABLE chunks(id INTEGER PRIMARY KEY, document_id TEXT)")
         conn.execute("CREATE TABLE tags(document_id TEXT, tag TEXT)")
-        conn.execute("CREATE TABLE related_to(from_doc TEXT, to_doc TEXT, label TEXT)")
-        conn.execute("CREATE TABLE similar_to(from_chunk INTEGER, to_chunk INTEGER)")
         conn.execute("INSERT INTO documents(id, type) VALUES('1', 'memory'), ('2', 'url')")
         conn.execute("INSERT INTO chunks(id, document_id) VALUES(1, '1'), (2, '1'), (3, '2')")
         conn.execute("INSERT INTO tags(document_id, tag) VALUES('1', 'a'), ('2', 'b')")
-        conn.execute("INSERT INTO related_to(from_doc, to_doc, label) VALUES('1', '2', '')")
-        conn.execute("INSERT INTO similar_to(from_chunk, to_chunk) VALUES(1, 2), (2, 3)")
     finally:
         conn.close()

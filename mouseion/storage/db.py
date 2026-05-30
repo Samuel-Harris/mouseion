@@ -18,7 +18,7 @@ from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
 from mouseion.support.utils import json_dumps, json_loads
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 EMBEDDING_DIMS = 768
 VECTOR_TABLE = "chunk_vectors"
 VECTOR_COLUMN = "embedding"
@@ -154,8 +154,8 @@ class SQLiteStore:
         def run(conn: apsw.Connection) -> None:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            conn.execute("DELETE FROM meta WHERE key = ?", ("last_recompute_at",))
             self._ensure_meta_sync(conn, "schema_version", SCHEMA_VERSION)
-            self._ensure_meta_sync(conn, "last_recompute_at", "")
             self._ensure_meta_sync(conn, VECTOR_META_MODE, "exact")
             self._ensure_meta_sync(
                 conn, VECTOR_META_QBITS, str(self.settings.vector_quantization_qbits)
@@ -512,8 +512,8 @@ class SQLiteStore:
 
         return await self.write(run)
 
-    async def delete_document(self, document_id: UUID) -> tuple[int, int]:
-        def run(conn: apsw.Connection) -> tuple[int, int]:
+    async def delete_document(self, document_id: UUID) -> int:
+        def run(conn: apsw.Connection) -> int:
             chunk_ids = [
                 int(row["id"])
                 for row in _rows_from_cursor(
@@ -522,33 +522,18 @@ class SQLiteStore:
                     (str(document_id),),
                 )
             ]
-            related_edges = _count(
-                conn,
-                "SELECT count(*) FROM related_to WHERE from_doc = ? OR to_doc = ?",
-                (str(document_id), str(document_id)),
-            )
-            similar_edges = 0
-            if chunk_ids:
-                placeholders = ",".join("?" for _ in chunk_ids)
-                similar_edges = _count(
-                    conn,
-                    f"""
-                    SELECT count(*)
-                    FROM similar_to
-                    WHERE from_chunk IN ({placeholders}) OR to_chunk IN ({placeholders})
-                    """,
-                    (*chunk_ids, *chunk_ids),
-                )
             conn.execute("DELETE FROM documents WHERE id = ?", (str(document_id),))
             if chunk_ids:
                 _mark_quantization_dirty_sync(conn)
-            return len(chunk_ids), len(chunk_ids) + related_edges + similar_edges
+            return len(chunk_ids)
 
         deleted = await self.write(run)
-        return (int(deleted[0]), int(deleted[1]))
+        return int(deleted)
 
 
 SCHEMA_STATEMENTS = [
+    "DROP TABLE IF EXISTS similar_to",
+    "DROP TABLE IF EXISTS related_to",
     """
     CREATE TABLE IF NOT EXISTS documents(
       id TEXT PRIMARY KEY,
@@ -625,27 +610,8 @@ SCHEMA_STATEMENTS = [
       INSERT INTO chunks_fts(rowid, content) VALUES(new.id, new.content);
     END
     """,
-    """
-    CREATE TABLE IF NOT EXISTS similar_to(
-      from_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-      to_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-      score REAL,
-      CHECK(from_chunk < to_chunk),
-      PRIMARY KEY(from_chunk, to_chunk)
-    )
-    """,
     "DROP INDEX IF EXISTS idx_sim_from",
-    "CREATE INDEX IF NOT EXISTS idx_sim_to ON similar_to(to_chunk)",
-    """
-    CREATE TABLE IF NOT EXISTS related_to(
-      from_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      to_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      label TEXT DEFAULT '',
-      note TEXT,
-      created_at TEXT,
-      PRIMARY KEY(from_doc, to_doc, label)
-    )
-    """,
+    "DROP INDEX IF EXISTS idx_sim_to",
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
 ]
 
@@ -744,13 +710,6 @@ def _fetch_one(
 ) -> dict[str, Any] | None:
     rows = _rows_from_cursor(conn.cursor(), query, parameters)
     return rows[0] if rows else None
-
-
-def _count(conn: apsw.Connection, query: str, parameters: tuple[Any, ...] = ()) -> int:
-    row = _fetch_one(conn, query, parameters)
-    if not row:
-        return 0
-    return int(next(iter(row.values())))
 
 
 def _batched[T](items: list[T], size: int) -> list[list[T]]:

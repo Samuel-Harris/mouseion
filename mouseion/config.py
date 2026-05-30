@@ -28,9 +28,6 @@ class Settings(BaseSettings):
     chunk_target_tokens: int = Field(default=512, alias="CHUNK_TARGET_TOKENS")
     chunk_max_tokens: int = Field(default=1024, alias="CHUNK_MAX_TOKENS")
     chunk_min_tokens: int = Field(default=100, alias="CHUNK_MIN_TOKENS")
-    similarity_threshold: float = Field(default=0.82, alias="SIMILARITY_THRESHOLD")
-    similarity_top_k: int = Field(default=10, alias="SIMILARITY_TOP_K")
-    similar_edge_recompute_hours: float = Field(default=24, alias="SIMILAR_EDGE_RECOMPUTE_HOURS")
     rrf_k: int = Field(default=60, alias="RRF_K")
     vector_search_mode: Literal["exact", "quantized"] = Field(
         default="exact", alias="MOUSEION_VECTOR_SEARCH_MODE"
@@ -89,10 +86,6 @@ class Settings(BaseSettings):
             raise ValueError("CHUNK_TARGET_TOKENS must be >= CHUNK_MIN_TOKENS")
         if self.chunk_max_tokens < self.chunk_target_tokens:
             raise ValueError("CHUNK_MAX_TOKENS must be >= CHUNK_TARGET_TOKENS")
-        if not (0 < self.similarity_threshold <= 1):
-            raise ValueError("SIMILARITY_THRESHOLD must be in (0, 1]")
-        if self.similarity_top_k < 1:
-            raise ValueError("SIMILARITY_TOP_K must be positive")
         if self.rrf_k < 1:
             raise ValueError("RRF_K must be positive")
         return self

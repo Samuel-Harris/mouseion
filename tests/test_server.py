@@ -40,7 +40,6 @@ def test_mcp_endpoint_runs_inside_main_lifespan(
     monkeypatch.setenv("MOUSEION_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MOUSEION_REPOS_DIR", str(tmp_path / "repos"))
     monkeypatch.setenv("MOUSEION_MCP_DESCRIPTION", "Test corpus description")
-    monkeypatch.setenv("SIMILAR_EDGE_RECOMPUTE_HOURS", "0")
     app = create_app()
     payload = {
         "jsonrpc": "2.0",

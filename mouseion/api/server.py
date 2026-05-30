@@ -14,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from mouseion.api.mcp_tools import build_mcp
-from mouseion.api.tasks import BackgroundTasks
 from mouseion.config import Settings
 from mouseion.domain.models import (
     AddFileInput,
@@ -24,7 +23,6 @@ from mouseion.domain.models import (
     DeleteInput,
     GetDocumentInput,
     ListInput,
-    RelateInput,
     SearchInput,
 )
 from mouseion.errors import MouseionError
@@ -50,21 +48,17 @@ def create_app() -> FastAPI:
     configure_logging(settings.log_level)
     logger = get_logger(__name__)
     service_ref: dict[str, MouseionService] = {}
-    tasks: BackgroundTasks | None = None
     mcp_app = build_mcp(
         service_ref, description=settings.mouseion_mcp_description
     ).streamable_http_app()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-        nonlocal tasks
         async with mcp_app.router.lifespan_context(mcp_app):
             settings.warn_if_non_loopback(logger)
             async with open_services(settings) as services:
                 service_ref["service"] = services.service
                 app.state.service = services.service
-                tasks = BackgroundTasks(settings, services.service.graph)
-                tasks.start()
                 logger.info(
                     "mouseion_daemon_started",
                     host=settings.mouseion_host,
@@ -73,7 +67,6 @@ def create_app() -> FastAPI:
                 try:
                     yield
                 finally:
-                    await tasks.stop()
                     logger.info("mouseion_daemon_stopped")
 
     app = FastAPI(title="Mouseion", lifespan=lifespan)
@@ -142,10 +135,6 @@ def create_app() -> FastAPI:
     async def api_search(input: SearchInput, request: Request) -> JsonDict:
         return await _service(request).search(input)
 
-    @app.post("/api/relate")
-    async def api_relate(input: RelateInput, request: Request) -> JsonDict:
-        return await _service(request).relate(input)
-
     @app.delete("/api/documents/{document_id}")
     async def api_delete(document_id: str, request: Request) -> JsonDict:
         return await _service(request).delete(DeleteInput.model_validate({"id": document_id}))
@@ -153,10 +142,6 @@ def create_app() -> FastAPI:
     @app.post("/api/export")
     async def api_export(request: Request) -> JsonDict:
         return await _service(request).export()
-
-    @app.post("/api/recompute_edges")
-    async def api_recompute_edges(request: Request) -> JsonDict:
-        return await _service(request).recompute_edges()
 
     @app.get("/api/vector/status")
     async def api_vector_status(request: Request) -> JsonDict:
