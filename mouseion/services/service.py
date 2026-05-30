@@ -10,17 +10,19 @@ from mouseion.domain.models import (
     AddRepoInput,
     AddUrlInput,
     DeleteInput,
+    DocumentOutlineInput,
     DocumentType,
-    GetDocumentInput,
     IngestedContent,
     ListInput,
+    ReadDocumentInput,
+    SearchDocumentInput,
     SearchInput,
 )
-from mouseion.errors import DocumentNotFoundError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.embedder import Embedder
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
+from mouseion.services.document_reader import DocumentReader
 from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.storage.db import SQLiteStore
@@ -38,6 +40,7 @@ class MouseionService:
     searcher: SearchService
     repos: RepoService
     exporter: Exporter
+    document_reader: DocumentReader
 
     async def add_url(self, input: AddUrlInput) -> JsonDict:
         content = await self.ingestor.fetch_url(str(input.url))
@@ -68,15 +71,14 @@ class MouseionService:
             search_syntax=input.search_syntax,
         )
 
-    async def get_document(self, input: GetDocumentInput) -> JsonDict:
-        document = await self.store.get_document(input.document_id)
-        if document is None:
-            raise DocumentNotFoundError(f"Document not found: {input.document_id}")
-        chunks = await self.store.get_chunks_for_document(input.document_id)
-        return {
-            "document": document.model_dump(mode="json"),
-            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
-        }
+    async def read_document(self, input: ReadDocumentInput) -> JsonDict:
+        return await self.document_reader.read_document(input)
+
+    async def document_outline(self, input: DocumentOutlineInput) -> JsonDict:
+        return await self.document_reader.document_outline(input)
+
+    async def search_document(self, input: SearchDocumentInput) -> JsonDict:
+        return await self.document_reader.search_document(input)
 
     async def list_documents(self, input: ListInput) -> JsonDict:
         items, total = await self.store.list_documents(input.type, input.limit, input.offset)

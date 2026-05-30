@@ -76,6 +76,13 @@ class DocumentChunkUpsertResult:
     chunks_created: int
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentChunkStats:
+    total_chunks: int
+    total_chars: int
+    total_tokens: int
+
+
 class SQLiteStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -375,6 +382,55 @@ class SQLiteStore:
             (str(document_id),),
         )
         return [chunk_from_row(row) for row in result.rows]
+
+    async def get_text_chunks_for_document(
+        self,
+        document_id: UUID,
+        *,
+        start_chunk_index: int = 0,
+        limit: int | None = None,
+    ) -> list[Chunk]:
+        limit_sql = "" if limit is None else "LIMIT ?"
+        params: tuple[Any, ...] = (
+            (str(document_id), start_chunk_index)
+            if limit is None
+            else (str(document_id), start_chunk_index, limit)
+        )
+        result = await self.execute(
+            f"""
+            SELECT c.id,
+                   c.document_id,
+                   c.content,
+                   c.chunk_index,
+                   c.token_count,
+                   c.created_at
+            FROM chunks c
+            WHERE c.document_id = ?
+              AND c.chunk_index >= ?
+            ORDER BY c.chunk_index
+            {limit_sql}
+            """,
+            params,
+        )
+        return [chunk_from_row(row) for row in result.rows]
+
+    async def document_chunk_stats(self, document_id: UUID) -> DocumentChunkStats:
+        result = await self.execute(
+            """
+            SELECT count(*) AS total_chunks,
+                   COALESCE(sum(length(content)), 0) AS total_chars,
+                   COALESCE(sum(token_count), 0) AS total_tokens
+            FROM chunks
+            WHERE document_id = ?
+            """,
+            (str(document_id),),
+        )
+        row = result.first() or {}
+        return DocumentChunkStats(
+            total_chunks=int(row.get("total_chunks", 0)),
+            total_chars=int(row.get("total_chars", 0)),
+            total_tokens=int(row.get("total_tokens", 0)),
+        )
 
     async def get_chunk_embeddings_for_document(self, document_id: UUID) -> list[dict[str, Any]]:
         return (

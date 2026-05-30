@@ -21,8 +21,10 @@ from mouseion.domain.models import (
     AddRepoInput,
     AddUrlInput,
     DeleteInput,
-    GetDocumentInput,
+    DocumentOutlineInput,
     ListInput,
+    ReadDocumentInput,
+    SearchDocumentInput,
     SearchInput,
 )
 from mouseion.errors import MouseionError
@@ -41,6 +43,11 @@ class VectorModeInput(BaseModel):
 class VectorQuantizeInput(BaseModel):
     qbits: int = Field(ge=2, le=4)
     preload: bool = False
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=10, ge=1, le=100)
 
 
 def create_app() -> FastAPI:
@@ -115,8 +122,45 @@ def create_app() -> FastAPI:
 
     @app.get("/api/documents/{document_id}")
     async def api_document(document_id: str, request: Request) -> JsonDict:
-        return await _service(request).get_document(
-            GetDocumentInput.model_validate({"document_id": document_id})
+        return await _service(request).read_document(
+            ReadDocumentInput.model_validate({"document_id": document_id})
+        )
+
+    @app.get("/api/documents/{document_id}/read")
+    async def api_document_read(
+        document_id: str,
+        request: Request,
+        cursor: str | None = None,
+        max_chars: int = 12000,
+        max_chunks: int = 8,
+        include_metadata: bool = True,
+    ) -> JsonDict:
+        return await _service(request).read_document(
+            ReadDocumentInput.model_validate(
+                {
+                    "document_id": document_id,
+                    "cursor": cursor,
+                    "max_chars": max_chars,
+                    "max_chunks": max_chunks,
+                    "include_metadata": include_metadata,
+                }
+            )
+        )
+
+    @app.get("/api/documents/{document_id}/outline")
+    async def api_document_outline(document_id: str, request: Request) -> JsonDict:
+        return await _service(request).document_outline(
+            DocumentOutlineInput.model_validate({"document_id": document_id})
+        )
+
+    @app.post("/api/documents/{document_id}/search")
+    async def api_document_search(
+        document_id: str, input: DocumentSearchRequest, request: Request
+    ) -> JsonDict:
+        return await _service(request).search_document(
+            SearchDocumentInput.model_validate(
+                {"document_id": document_id, "query": input.query, "top_k": input.top_k}
+            )
         )
 
     @app.post("/api/url")

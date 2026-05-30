@@ -13,6 +13,10 @@ class DocumentNotFoundError(MouseionError):
     """Raised when a document id does not exist."""
 
 
+class InvalidCursorError(MouseionError):
+    """Raised when a paginated read cursor is malformed or stale."""
+
+
 class UnsupportedFileTypeError(MouseionError):
     """Raised when a file type cannot be ingested."""
 

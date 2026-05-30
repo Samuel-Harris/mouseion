@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 
 from mouseion.config import Settings
-from mouseion.domain.models import GetDocumentInput, SearchInput
+from mouseion.domain.models import ReadDocumentInput, SearchInput
 from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
 from mouseion.ingest.repo import RepoService
+from mouseion.services.document_reader import DocumentReader
 from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
@@ -173,14 +174,16 @@ async def imported_service(
     store = SQLiteStore(settings)
     await store.open()
     embedder = FakeEmbedder()
+    searcher = SearchService(store, embedder, settings.rrf_k)  # type: ignore[arg-type]
     service = MouseionService(
         store,
         Ingestor(settings),
         Chunker(settings),
         embedder,  # type: ignore[arg-type]
-        SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
+        searcher,
         RepoService(settings),
         Exporter(settings, store),
+        DocumentReader(store, searcher),
     )
     try:
         yield store, service, settings
@@ -323,7 +326,7 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     assert document["metadata"]["html_url"] == "https://export.arxiv.org/html/1234.0001"
     assert "journal_ref" not in document["metadata"]
     assert "authors_parsed" not in document["metadata"]
-    full_document = await service.get_document(GetDocumentInput(document_id=document["id"]))
+    full_document = await service.read_document(ReadDocumentInput(document_id=document["id"]))
     assert full_document["document"]["metadata"]["journal_ref"] == "Journal Ref"
     assert full_document["document"]["metadata"]["authors_parsed"] == [
         ["Lovelace", "Ada", ""],
