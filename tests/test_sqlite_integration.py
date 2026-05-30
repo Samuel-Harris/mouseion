@@ -29,6 +29,7 @@ from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore, embedding_blob
+from mouseion.storage.stats import STATS_COUNTERS_INITIALISED, stats_snapshot_sync
 
 
 class FakeEmbedder:
@@ -523,7 +524,43 @@ async def test_service_stats_include_documents_chunks_tags_and_types(
     assert stats["tags"] == 1
     assert "edges" not in stats
     assert stats["background_tasks"]["stats_counters"]["status"] == "complete"
+    assert stats["background_tasks"]["stats_counters"]["initialised"] is True
     assert stats["background_tasks"]["search_fts"]["status"] == "complete"
+
+
+async def test_stats_fall_back_to_exact_counts_until_counters_are_initialised(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stats.db"
+    conn = apsw.Connection(str(db_path))
+    try:
+        conn.execute("CREATE TABLE documents(id TEXT PRIMARY KEY, type TEXT)")
+        conn.execute("CREATE TABLE chunks(id INTEGER PRIMARY KEY, document_id TEXT)")
+        conn.execute("CREATE TABLE tags(document_id TEXT, tag TEXT)")
+        conn.execute("CREATE TABLE stats_counters(name TEXT PRIMARY KEY, value INTEGER)")
+        conn.execute("CREATE TABLE stats_document_types(type TEXT PRIMARY KEY, value INTEGER)")
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO documents(id, type) VALUES('doc-1', 'memory')")
+        conn.execute("INSERT INTO chunks(id, document_id) VALUES(1, 'doc-1')")
+        conn.execute("INSERT INTO tags(document_id, tag) VALUES('doc-1', 'stats')")
+        conn.executemany(
+            "INSERT INTO stats_counters(name, value) VALUES(?, ?)",
+            [("documents", 0), ("chunks", 0), ("tags", 0)],
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, 'false')",
+            (STATS_COUNTERS_INITIALISED,),
+        )
+
+        stats = stats_snapshot_sync(conn)
+    finally:
+        conn.close()
+
+    assert stats["documents"] == 1
+    assert stats["documents_by_type"] == {"memory": 1}
+    assert stats["chunks"] == 1
+    assert stats["tags"] == 1
+    assert stats["stats_ready"] is False
 
 
 async def test_search_and_stats_can_overlap(

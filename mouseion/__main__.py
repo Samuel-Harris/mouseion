@@ -18,6 +18,10 @@ import uvicorn
 
 from mouseion.config import Settings
 from mouseion.storage.db import SQLiteStore
+from mouseion.storage.stats import (
+    LEGACY_STATS_COUNTERS_INITIALIZED,
+    STATS_COUNTERS_INITIALISED,
+)
 from mouseion.support.logging_config import configure_logging, get_logger
 
 OLLAMA_START_TIMEOUT_SECONDS = 20.0
@@ -274,7 +278,8 @@ def _local_database_stats(settings: Settings) -> JsonDict:
 
 def _stats_from_connection(conn: apsw.Connection) -> JsonDict:
     document_types: dict[str, int] = {}
-    if _table_exists(conn, "stats_document_types"):
+    counters_initialised = _stats_counters_initialised(conn)
+    if counters_initialised and _table_exists(conn, "stats_document_types"):
         for doc_type, total in conn.execute(
             "SELECT type, value FROM stats_document_types WHERE value > 0 ORDER BY type"
         ):
@@ -286,7 +291,7 @@ def _stats_from_connection(conn: apsw.Connection) -> JsonDict:
             document_types[str(doc_type)] = int(total)
 
     counters = _stats_counters(conn)
-    if counters is not None:
+    if counters_initialised and counters is not None:
         return {
             "documents": counters.get("documents", 0),
             "chunks": counters.get("chunks", 0),
@@ -300,6 +305,19 @@ def _stats_from_connection(conn: apsw.Connection) -> JsonDict:
         "tags": _count_table(conn, "tags"),
         "documents_by_type": document_types,
     }
+
+
+def _stats_counters_initialised(conn: apsw.Connection) -> bool:
+    if not _table_exists(conn, "meta"):
+        return False
+    row = next(
+        conn.execute(
+            "SELECT value FROM meta WHERE key IN (?, ?) ORDER BY key LIMIT 1",
+            (STATS_COUNTERS_INITIALISED, LEGACY_STATS_COUNTERS_INITIALIZED),
+        ),
+        None,
+    )
+    return row is not None and str(row[0]).lower() in {"1", "true", "yes", "on"}
 
 
 def _stats_counters(conn: apsw.Connection) -> dict[str, int] | None:
