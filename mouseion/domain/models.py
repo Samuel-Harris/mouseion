@@ -92,6 +92,7 @@ class SearchInput(BaseModel):
     query: str
     top_k: int = Field(default=10, ge=1, le=100)
     filter: SearchFilter | None = None
+    search_syntax: Literal["plain", "advanced"] = "plain"
 
 
 class GetDocumentInput(BaseModel):

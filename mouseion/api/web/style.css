@@ -27,6 +27,7 @@ button {
 }
 
 input,
+select,
 textarea {
   border: 1px solid #c8c3b8;
   border-radius: 6px;
@@ -111,6 +112,12 @@ h2 {
   gap: 8px;
 }
 
+.inline-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, auto);
+  gap: 8px;
+}
+
 .output-panel {
   margin-top: 14px;
 }
@@ -128,6 +135,35 @@ h2 {
 .meta {
   color: #615b50;
   font-size: 13px;
+}
+
+.meta a {
+  color: inherit;
+}
+
+.byline {
+  color: #4d463b;
+  font-size: 13px;
+  margin-bottom: 5px;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tags span {
+  border: 1px solid #d2cbbb;
+  border-radius: 999px;
+  color: #4b574b;
+  font-size: 12px;
+  padding: 2px 7px;
+}
+
+.empty {
+  color: #615b50;
 }
 
 .ok {

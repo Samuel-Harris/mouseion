@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import datetime
 from struct import pack, unpack
@@ -14,10 +16,21 @@ from anyio.to_thread import run_sync
 
 from mouseion.config import Settings
 from mouseion.domain.models import Chunk, Document, DocumentType, utc_now
+from mouseion.storage import background
+from mouseion.storage.schema import SCHEMA_STATEMENTS, SCHEMA_VERSION
+from mouseion.storage.search_index import (
+    ensure_search_fts_backfill_status_sync,
+    insert_search_index_row_sync,
+)
+from mouseion.storage.stats import (
+    background_status_sync,
+    ensure_stats_counters_sync,
+    stats_snapshot_sync,
+)
 from mouseion.storage.vector import SQLiteVectorBackend, VectorRuntimeConfig
 from mouseion.support.utils import json_dumps, json_loads
 
-SCHEMA_VERSION = "3"
+READ_POOL_SIZE = 4
 T = TypeVar("T")
 
 
@@ -68,17 +81,26 @@ class SQLiteStore:
         self.settings = settings
         self.vector_backend = SQLiteVectorBackend(settings)
         self.database: apsw.Connection | None = None
+        self._readonly = False
         self._write_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._read_pool: list[apsw.Connection] = []
+        self._read_pool_lock = threading.Lock()
 
     async def open(self) -> None:
         self.settings.ensure_directories()
         await run_sync(self._open_sync)
         await self.bootstrap()
+        self.start_background_tasks()
 
     async def open_readonly(self) -> None:
         await run_sync(self._open_sync, True)
 
     def _open_sync(self, readonly: bool = False) -> None:
+        self._readonly = readonly
+        self.database = self._connect_sync(readonly=readonly)
+
+    def _connect_sync(self, *, readonly: bool) -> apsw.Connection:
         flags = (
             apsw.SQLITE_OPEN_READONLY
             if readonly
@@ -93,9 +115,16 @@ class SQLiteStore:
         conn.execute("PRAGMA busy_timeout=5000")
         if readonly:
             self.vector_backend.initialize_if_present_sync(conn)
-        self.database = conn
+        return conn
 
     async def close(self) -> None:
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*self._background_tasks)
+        self._background_tasks.clear()
+        self._close_read_pool_sync()
         if self.database is not None:
             self.database.close()
         self.database = None
@@ -110,12 +139,49 @@ class SQLiteStore:
     ) -> QueryResult:
         return await run_sync(self._execute_sync, query, parameters or ())
 
+    async def read(self, fn: Callable[[apsw.Connection], T]) -> T:
+        return await run_sync(self._read_sync, fn)
+
+    def _read_sync(self, fn: Callable[[apsw.Connection], T]) -> T:
+        with self._pooled_read_connection_sync() as conn:
+            return fn(conn)
+
     def _execute_sync(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any]
     ) -> QueryResult:
-        return QueryResult(_rows_from_cursor(self.connection().cursor(), query, parameters))
+        with self._pooled_read_connection_sync() as conn:
+            return QueryResult(_rows_from_cursor(conn.cursor(), query, parameters))
+
+    @contextlib.contextmanager
+    def _pooled_read_connection_sync(self) -> Generator[apsw.Connection]:
+        conn: apsw.Connection | None = None
+        with self._read_pool_lock:
+            if self._read_pool:
+                conn = self._read_pool.pop()
+        if conn is None:
+            conn = self._connect_sync(readonly=True)
+        try:
+            yield conn
+        finally:
+            should_close = False
+            with self._read_pool_lock:
+                if len(self._read_pool) < READ_POOL_SIZE:
+                    self._read_pool.append(conn)
+                else:
+                    should_close = True
+            if should_close:
+                conn.close()
+
+    def _close_read_pool_sync(self) -> None:
+        with self._read_pool_lock:
+            connections = self._read_pool
+            self._read_pool = []
+        for conn in connections:
+            conn.close()
 
     async def write(self, fn: Callable[[apsw.Connection], T]) -> T:
+        if self._readonly:
+            raise RuntimeError("SQLite database was opened read-only")
         async with self._write_lock:
             return await run_sync(self._write_sync, fn)
 
@@ -135,8 +201,9 @@ class SQLiteStore:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
             conn.execute("DELETE FROM meta WHERE key = ?", ("last_recompute_at",))
-            self._ensure_meta_sync(conn, "schema_version", SCHEMA_VERSION)
             self.vector_backend.ensure_bootstrap_meta_sync(conn)
+            ensure_stats_counters_sync(conn)
+            ensure_search_fts_backfill_status_sync(conn)
             conn.execute(
                 """
                 INSERT INTO meta(key, value) VALUES(?, ?)
@@ -147,6 +214,17 @@ class SQLiteStore:
             self.vector_backend.initialize_sync(conn)
 
         await self.write(run)
+
+    def start_background_tasks(self) -> None:
+        if self._readonly:
+            return
+        for runner in (background.backfill_stats_counters, background.backfill_search_fts):
+            task = asyncio.create_task(runner(self))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def background_status(self) -> dict[str, Any]:
+        return await self.read(background_status_sync)
 
     def _ensure_meta_sync(self, conn: apsw.Connection, key: str, value: str) -> None:
         row = _fetch_one(conn, "SELECT value FROM meta WHERE key = ?", (key,))
@@ -175,6 +253,9 @@ class SQLiteStore:
 
     async def vector_status(self) -> dict[str, Any]:
         return await self.vector_backend.status(self.execute)
+
+    async def stats(self) -> dict[str, Any]:
+        return await self.read(stats_snapshot_sync)
 
     async def vector_quantize_memory(self, qbits: int) -> int:
         return await self.vector_backend.quantize_memory(self.execute, qbits)
@@ -370,7 +451,7 @@ class SQLiteStore:
 
                 _upsert_document_row(conn, document_id_text, document, now_timestamp)
                 _insert_document_tags(conn, document_id_text, document.tags)
-                _insert_document_chunks(conn, document_id_text, document.chunks, now_timestamp)
+                _insert_document_chunks(conn, document_id_text, document, now_timestamp)
                 if exists or document.chunks:
                     self.vector_backend.mark_dirty_sync(conn)
                 results.append(
@@ -404,88 +485,6 @@ class SQLiteStore:
         deleted = await self.write(run)
         return int(deleted)
 
-
-SCHEMA_STATEMENTS = [
-    """
-    CREATE TABLE IF NOT EXISTS documents(
-      id TEXT PRIMARY KEY,
-      type TEXT CHECK(type IN('document','memory','url','file')),
-      title TEXT,
-      source TEXT,
-      content_hash TEXT,
-      created_at TEXT,
-      updated_at TEXT,
-      metadata TEXT DEFAULT '{}'
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_doc_source ON documents(source)",
-    "CREATE INDEX IF NOT EXISTS idx_doc_type_source ON documents(type, source)",
-    "CREATE INDEX IF NOT EXISTS idx_doc_type_content_hash ON documents(type, content_hash)",
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_unique_type_source
-    ON documents(type, source)
-    WHERE type != 'memory'
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_unique_memory_content_hash
-    ON documents(type, content_hash)
-    WHERE type = 'memory'
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tags(
-      document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      tag TEXT,
-      PRIMARY KEY(document_id, tag)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS chunks(
-      id INTEGER PRIMARY KEY,
-      document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-      content TEXT,
-      chunk_index INTEGER,
-      token_count INTEGER,
-      created_at TEXT
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_chunk_doc ON chunks(document_id)",
-    """
-    CREATE TABLE IF NOT EXISTS chunk_vectors(
-      chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
-      embedding BLOB NOT NULL
-    )
-    """,
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-      content,
-      content='chunks',
-      content_rowid='id',
-      tokenize='porter unicode61'
-    )
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-      INSERT INTO chunks_fts(rowid, content) VALUES(new.id, new.content);
-    END
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-      INSERT INTO chunks_fts(chunks_fts, rowid, content)
-      VALUES('delete', old.id, old.content);
-      DELETE FROM chunk_vectors WHERE chunk_id = old.id;
-    END
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-      INSERT INTO chunks_fts(chunks_fts, rowid, content)
-      VALUES('delete', old.id, old.content);
-      INSERT INTO chunks_fts(rowid, content) VALUES(new.id, new.content);
-    END
-    """,
-    "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
-]
-
-
 def _rows_from_cursor(
     cursor: apsw.Cursor, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any] = ()
 ) -> list[dict[str, Any]]:
@@ -505,6 +504,16 @@ def _fetch_one(
 ) -> dict[str, Any] | None:
     rows = _rows_from_cursor(conn.cursor(), query, parameters)
     return rows[0] if rows else None
+
+
+def _set_meta_sync(conn: apsw.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
 
 
 def _batched[T](items: list[T], size: int) -> list[list[T]]:
@@ -598,10 +607,10 @@ def _insert_document_tags(conn: apsw.Connection, document_id: str, tags: list[st
 def _insert_document_chunks(
     conn: apsw.Connection,
     document_id: str,
-    chunks: list[tuple[str, int, list[float]]],
+    document: DocumentChunkUpsert,
     now_timestamp: str,
 ) -> None:
-    for chunk_index, (content, token_count, embedding) in enumerate(chunks):
+    for chunk_index, (content, token_count, embedding) in enumerate(document.chunks):
         conn.execute(
             """
             INSERT INTO chunks(document_id, content, chunk_index, token_count, created_at)
@@ -613,6 +622,15 @@ def _insert_document_chunks(
         conn.execute(
             "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
             (chunk_id, embedding_blob(embedding)),
+        )
+        insert_search_index_row_sync(
+            conn,
+            chunk_id=chunk_id,
+            title=document.title,
+            source=document.source,
+            tags=document.tags,
+            metadata=document.metadata,
+            content=content,
         )
 
 

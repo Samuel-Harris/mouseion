@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from mouseion.config import Settings
-from mouseion.domain.models import SearchInput
+from mouseion.domain.models import GetDocumentInput, SearchInput
 from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
@@ -321,8 +321,11 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     assert document["title"] == "Neural Symbolic Planning"
     assert document["metadata"]["pdf_url"] == "https://export.arxiv.org/pdf/1234.0001"
     assert document["metadata"]["html_url"] == "https://export.arxiv.org/html/1234.0001"
-    assert document["metadata"]["journal_ref"] == "Journal Ref"
-    assert document["metadata"]["authors_parsed"] == [
+    assert "journal_ref" not in document["metadata"]
+    assert "authors_parsed" not in document["metadata"]
+    full_document = await service.get_document(GetDocumentInput(document_id=document["id"]))
+    assert full_document["document"]["metadata"]["journal_ref"] == "Journal Ref"
+    assert full_document["document"]["metadata"]["authors_parsed"] == [
         ["Lovelace", "Ada", ""],
         ["Hopper", "Grace", ""],
     ]
@@ -339,6 +342,14 @@ async def test_import_creates_searchable_documents_with_arxiv_metadata_and_tags(
     )
     assert "Neural Symbolic Planning" in chunks.first()["content"]  # type: ignore[index]
     assert "zeta planning" in chunks.first()["content"]  # type: ignore[index]
+
+    author_result = await service.search(SearchInput(query="Grace Hopper", top_k=3))
+    source_result = await service.search(SearchInput(query="1234.0001", top_k=3))
+    category_result = await service.search(SearchInput(query="stat.ML", top_k=3))
+
+    assert author_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
+    assert source_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
+    assert category_result["results"][0]["document"]["source"] == "arxiv:1234.0001"
 
 
 async def test_import_batches_embeddings_and_writes_one_chunk_per_paper(

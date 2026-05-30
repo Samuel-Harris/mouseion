@@ -127,7 +127,15 @@ async function jsonFetch(url, options = {}) {
     ...options,
     headers: { "content-type": "application/json", ...(options.headers || {}) },
   });
-  const body = await response.json();
+  const text = await response.text();
+  let body = {};
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = { detail: text };
+    }
+  }
   if (!response.ok) {
     throw new Error(body.detail || body.error || "Request failed");
   }
@@ -142,12 +150,27 @@ async function refreshStats() {
 function renderResults(results) {
   const root = $("results");
   root.innerHTML = "";
+  if (!results.length) {
+    root.innerHTML = '<p class="empty">No confident results.</p>';
+    return;
+  }
   for (const result of results) {
     const article = document.createElement("article");
     article.className = "result";
+    const document = result.document;
+    const metadata = document.metadata || {};
+    const sourceUrl = metadata.html_url || metadata.pdf_url || "";
+    const source = sourceUrl
+      ? `<a href="${escapeAttribute(sourceUrl)}" target="_blank" rel="noreferrer">${escapeHtml(document.source)}</a>`
+      : escapeHtml(document.source);
+    const tags = (document.tags || []).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("");
+    const authors = metadata.authors ? `<p class="byline">${escapeHtml(metadata.authors)}</p>` : "";
+    const updated = metadata.update_date ? ` · updated ${escapeHtml(metadata.update_date)}` : "";
     article.innerHTML = `
-      <h3>${escapeHtml(result.document.title)}</h3>
-      <p class="meta">${escapeHtml(result.document.type)} · score ${Number(result.score).toFixed(4)}</p>
+      <h3>${escapeHtml(document.title)}</h3>
+      ${authors}
+      <p class="meta">${source} · ${escapeHtml(document.type)} · ${escapeHtml(result.match || "match")} · score ${Number(result.score).toFixed(3)}${updated}</p>
+      <div class="tags">${tags}</div>
       <p>${escapeHtml(result.content).slice(0, 700)}</p>
     `;
     root.appendChild(article);
@@ -158,6 +181,10 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char];
   });
+}
+
+function escapeAttribute(value) {
+  return escapeHtml(value).replace(/`/g, "&#096;");
 }
 
 $("refresh").addEventListener("click", refreshStats);
@@ -233,11 +260,23 @@ $("search-form").addEventListener("submit", async (event) => {
   try {
     const body = {
       query: $("search-input").value,
-      top_k: 10,
+      top_k: Number($("search-top-k").value),
+      search_syntax: $("search-advanced").checked ? "advanced" : "plain",
     };
+    const type = $("search-type").value;
+    const tagValues = tags($("search-tags").value);
+    if (type !== "all" || tagValues.length) {
+      body.filter = {};
+      if (type !== "all") {
+        body.filter.type = type;
+      }
+      if (tagValues.length) {
+        body.filter.tags = tagValues;
+      }
+    }
     const result = await jsonFetch("/api/search", { method: "POST", body: JSON.stringify(body) });
     renderResults(result.results);
-    showMessage(`${result.results.length} results`);
+    showMessage(result.message || `${result.results.length} results`);
   } catch (error) {
     showMessage(error.message, true);
   }

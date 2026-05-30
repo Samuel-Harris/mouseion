@@ -1,11 +1,11 @@
-name: Pyright
+name: CI
 
 on:
   pull_request:
 
 jobs:
-  pyright:
-    name: Pyright
+  test:
+    name: Test
     runs-on: ubuntu-latest
 
     steps:
@@ -20,8 +20,17 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --locked --all-groups
+
+      - name: Run Ruff
+        run: uv run ruff check
 
       - name: Run Pyright
         run: uv run pyright
+
+      - name: Run tests
+        run: uv run pytest

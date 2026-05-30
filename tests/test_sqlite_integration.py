@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import UUID
@@ -28,18 +29,26 @@ from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
 from mouseion.storage.db import SQLiteStore, embedding_blob
+from mouseion.storage.stats import STATS_COUNTERS_INITIALISED, stats_snapshot_sync
 
 
 class FakeEmbedder:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.embed_calls: list[str] = []
 
     async def embed(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
         return [0.0] * 767 + [1.0]
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(texts)
         return [[0.0] * 767 + [1.0] for _ in texts]
+
+
+class OrthogonalSearchEmbedder(FakeEmbedder):
+    async def embed(self, text: str) -> list[float]:
+        return [1.0] + [0.0] * 767
 
 
 @pytest.fixture
@@ -226,6 +235,140 @@ async def test_search_filter_is_applied_before_candidate_limit(
     assert result["results"][0]["document"]["tags"] == ["target"]
 
 
+async def test_exact_lexical_match_beats_unhelpful_vector_rank(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    await service.add_memory(AddMemoryInput(content="Irrelevant first memory.", tags=[]))
+    await service.add_memory(
+        AddMemoryInput(content="Waterfall Transformer exact title and phrase.", tags=[])
+    )
+
+    result = await service.search(SearchInput(query="Waterfall Transformer", top_k=2))
+
+    assert result["results"][0]["content"] == "Waterfall Transformer exact title and phrase."
+    assert "lexical" in result["results"][0]["match"]
+
+
+async def test_plain_search_handles_punctuation_and_source_metadata(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "arxiv:2411.18944",
+                "Pose estimation content without the identifier.",
+                title="Waterfall Transformer for Multi-person Pose Estimation",
+            )
+        ]
+    )
+
+    result = await service.search(SearchInput(query="2411.18944", top_k=3))
+
+    assert result["results"][0]["document"]["source"] == "arxiv:2411.18944"
+
+
+async def test_exact_source_search_skips_embedding(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "arxiv:2411.18944",
+                "Pose estimation content without the identifier.",
+                title="Waterfall Transformer for Multi-person Pose Estimation",
+            )
+        ]
+    )
+    embedder = service.embedder  # type: ignore[assignment]
+    embedder.embed_calls = []  # type: ignore[attr-defined]
+
+    result = await service.search(SearchInput(query="2411.18944", top_k=3))
+
+    assert result["results"][0]["document"]["source"] == "arxiv:2411.18944"
+    assert embedder.embed_calls == []  # type: ignore[attr-defined]
+
+
+async def test_search_indexes_metadata_and_tags(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "metadata:paper",
+                "Body text does not contain the author name.",
+                tags=["arxiv:category:cs.ir"],
+                metadata={"authors": "Navin Ranjan", "categories": "cs.IR"},
+            )
+        ]
+    )
+
+    author_result = await service.search(SearchInput(query="Navin Ranjan", top_k=3))
+    category_result = await service.search(SearchInput(query="cs.IR", top_k=3))
+
+    assert author_result["results"][0]["document"]["source"] == "metadata:paper"
+    assert category_result["results"][0]["document"]["source"] == "metadata:paper"
+
+
+async def test_search_result_metadata_is_compact(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "metadata:compact",
+                "Compact metadata body uniquecompact.",
+                metadata={
+                    "authors": "Ada Lovelace",
+                    "pdf_url": "https://example.test/paper.pdf",
+                    "raw_record": "x" * 10_000,
+                },
+            )
+        ]
+    )
+
+    result = await service.search(SearchInput(query="uniquecompact", top_k=1))
+    document = result["results"][0]["document"]
+
+    assert result["results"][0]["authors"] == "Ada Lovelace"
+    assert document["metadata"] == {
+        "authors": "Ada Lovelace",
+        "pdf_url": "https://example.test/paper.pdf",
+    }
+
+
+async def test_vector_only_search_requires_confident_similarity(tmp_path: Path) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    store = SQLiteStore(settings)
+    await store.open()
+    embedder = OrthogonalSearchEmbedder()
+    service = MouseionService(
+        store,
+        Ingestor(settings),
+        Chunker(settings),
+        embedder,  # type: ignore[arg-type]
+        SearchService(store, embedder, settings.rrf_k),  # type: ignore[arg-type]
+        RepoService(settings),
+        Exporter(settings, store),
+    )
+    try:
+        await service.add_memory(AddMemoryInput(content="Known stored memory.", tags=[]))
+        result = await service.search(SearchInput(query="unrelatedzzzz", top_k=3))
+    finally:
+        await store.close()
+
+    assert result["results"] == []
+    assert result["message"] == "No confident results."
+
+
 async def test_exact_search_returns_memory_file_and_url_hits(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
@@ -380,6 +523,62 @@ async def test_service_stats_include_documents_chunks_tags_and_types(
     assert stats["chunks"] == 2
     assert stats["tags"] == 1
     assert "edges" not in stats
+    assert stats["background_tasks"]["stats_counters"]["status"] == "complete"
+    assert stats["background_tasks"]["stats_counters"]["initialised"] is True
+    assert stats["background_tasks"]["search_fts"]["status"] == "complete"
+
+
+async def test_stats_fall_back_to_exact_counts_until_counters_are_initialised(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stats.db"
+    conn = apsw.Connection(str(db_path))
+    try:
+        conn.execute("CREATE TABLE documents(id TEXT PRIMARY KEY, type TEXT)")
+        conn.execute("CREATE TABLE chunks(id INTEGER PRIMARY KEY, document_id TEXT)")
+        conn.execute("CREATE TABLE tags(document_id TEXT, tag TEXT)")
+        conn.execute("CREATE TABLE stats_counters(name TEXT PRIMARY KEY, value INTEGER)")
+        conn.execute("CREATE TABLE stats_document_types(type TEXT PRIMARY KEY, value INTEGER)")
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO documents(id, type) VALUES('doc-1', 'memory')")
+        conn.execute("INSERT INTO chunks(id, document_id) VALUES(1, 'doc-1')")
+        conn.execute("INSERT INTO tags(document_id, tag) VALUES('doc-1', 'stats')")
+        conn.executemany(
+            "INSERT INTO stats_counters(name, value) VALUES(?, ?)",
+            [("documents", 0), ("chunks", 0), ("tags", 0)],
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, 'false')",
+            (STATS_COUNTERS_INITIALISED,),
+        )
+
+        stats = stats_snapshot_sync(conn)
+    finally:
+        conn.close()
+
+    assert stats["documents"] == 1
+    assert stats["documents_by_type"] == {"memory": 1}
+    assert stats["chunks"] == 1
+    assert stats["tags"] == 1
+    assert stats["stats_ready"] is False
+
+
+async def test_search_and_stats_can_overlap(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    for index in range(10):
+        await service.add_memory(
+            AddMemoryInput(content=f"concurrent search stats needle {index}", tags=["overlap"])
+        )
+
+    search_result, stats = await asyncio.gather(
+        service.search(SearchInput(query="concurrent needle", top_k=3)),
+        service.stats(),
+    )
+
+    assert len(search_result["results"]) >= 1
+    assert stats["documents"] == 10
 
 
 async def test_batch_ingest_batches_embeddings(
@@ -480,6 +679,7 @@ async def test_delete_cascades_chunks_fts_and_vectors(
     counts = {
         "chunks": "SELECT count(*) AS total FROM chunks",
         "fts": "SELECT count(*) AS total FROM chunks_fts",
+        "search_fts": "SELECT count(*) AS total FROM search_fts",
         "vectors": "SELECT count(*) AS total FROM chunk_vectors",
     }
     for query in counts.values():
@@ -487,14 +687,21 @@ async def test_delete_cascades_chunks_fts_and_vectors(
         assert int(result.first()["total"]) == 0  # type: ignore[index]
 
 
-def _batch_item(source: str, content: str, tags: list[str] | None = None) -> BatchIngestItem:
+def _batch_item(
+    source: str,
+    content: str,
+    tags: list[str] | None = None,
+    *,
+    title: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> BatchIngestItem:
     return BatchIngestItem(
         content=IngestedContent(
-            title=source,
+            title=title or source,
             source=source,
             type=DocumentType.DOCUMENT,
             content=content,
-            metadata={"source": source},
+            metadata=metadata or {"source": source},
         ),
         tags=tags or [],
         chunks=[ChunkText(content=content, token_count=len(content.split()))],

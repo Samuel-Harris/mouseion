@@ -65,6 +65,7 @@ class MouseionService:
             input.query,
             top_k=input.top_k,
             filter=input.filter,
+            search_syntax=input.search_syntax,
         )
 
     async def get_document(self, input: GetDocumentInput) -> JsonDict:
@@ -110,37 +111,7 @@ class MouseionService:
         return await self.exporter.export()
 
     async def stats(self) -> JsonDict:
-        counts = await self._table_counts(
-            {
-                "documents": "documents",
-                "chunks": "chunks",
-                "tags": "tags",
-            }
-        )
-        document_types = await self.store.execute(
-            """
-            SELECT type, count(*) AS total
-            FROM documents
-            GROUP BY type
-            ORDER BY type
-            """
-        )
-        return {
-            "documents": counts["documents"],
-            "chunks": counts["chunks"],
-            "tags": counts["tags"],
-            "documents_by_type": {
-                str(row["type"]): int(row["total"]) for row in document_types.rows
-            },
-        }
-
-    async def _table_counts(self, tables: dict[str, str]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for key, table in tables.items():
-            result = await self.store.execute(f"SELECT count(*) AS total FROM {table}")
-            row = result.first()
-            counts[key] = int(row["total"] if row else 0)
-        return counts
+        return await self.store.stats()
 
     async def _ingest(self, content: IngestedContent, tags: list[str]) -> JsonDict:
         content_hash = canonical_text_hash(content.content)
