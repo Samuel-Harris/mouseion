@@ -135,6 +135,7 @@ async def test_fresh_database_does_not_create_graph_tables(tmp_path: Path) -> No
             SELECT name
             FROM sqlite_master
             WHERE type = 'table' AND name IN ('similar_to', 'related_to')
+            ORDER BY name
             """
         )
     finally:
@@ -143,7 +144,7 @@ async def test_fresh_database_does_not_create_graph_tables(tmp_path: Path) -> No
     assert tables.rows == []
 
 
-async def test_opening_existing_database_drops_graph_tables(tmp_path: Path) -> None:
+async def test_opening_existing_database_does_not_drop_graph_tables(tmp_path: Path) -> None:
     settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
     settings.ensure_directories()
     conn = apsw.Connection(str(settings.sqlite_path))
@@ -163,12 +164,13 @@ async def test_opening_existing_database_drops_graph_tables(tmp_path: Path) -> N
             SELECT name
             FROM sqlite_master
             WHERE type = 'table' AND name IN ('similar_to', 'related_to')
+            ORDER BY name
             """
         )
     finally:
         await store.close()
 
-    assert tables.rows == []
+    assert tables.rows == [{"name": "related_to"}, {"name": "similar_to"}]
 
 
 async def test_memory_replacement_preserves_document_identity(

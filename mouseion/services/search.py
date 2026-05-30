@@ -6,6 +6,7 @@ from typing import Any
 from mouseion.domain.models import SearchFilter
 from mouseion.ingest.embedder import Embedder
 from mouseion.storage.db import SQLiteStore, chunk_from_row, document_from_row, embedding_blob
+from mouseion.storage.vector import VECTOR_COLUMN, VECTOR_TABLE, vector_scan_function
 from mouseion.support.logging_config import get_logger
 
 
@@ -67,18 +68,14 @@ class SearchService:
         vector_config = await self.store.vector_runtime_config()
         if vector_config.warning is not None:
             get_logger(__name__).warning("vector_quantization_stale", message=vector_config.warning)
-        scan_function = (
-            "vector_quantize_scan"
-            if vector_config.active_mode == "quantized"
-            else "vector_full_scan"
-        )
+        scan_function = vector_scan_function(vector_config.active_mode)
         query_blob = embedding_blob(query_vector)
         if sql_filter.active:
             result = await self.store.execute(
                 f"""
                 SELECT v.rowid AS chunk_id,
                        v.distance
-                FROM {scan_function}('chunk_vectors', 'embedding', ?) AS v
+                FROM {scan_function}('{VECTOR_TABLE}', '{VECTOR_COLUMN}', ?) AS v
                 JOIN chunks c ON c.id = v.rowid
                 JOIN documents d ON d.id = c.document_id
                 WHERE 1 = 1
@@ -93,7 +90,7 @@ class SearchService:
                 f"""
                 SELECT v.rowid AS chunk_id,
                        v.distance
-                FROM {scan_function}('chunk_vectors', 'embedding', ?, ?) AS v
+                FROM {scan_function}('{VECTOR_TABLE}', '{VECTOR_COLUMN}', ?, ?) AS v
                 ORDER BY v.distance
                 """,
                 (query_blob, limit),
