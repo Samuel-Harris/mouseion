@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import UUID
@@ -33,8 +34,10 @@ from mouseion.storage.db import SQLiteStore, embedding_blob
 class FakeEmbedder:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.embed_calls: list[str] = []
 
     async def embed(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
         return [0.0] * 767 + [1.0]
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
@@ -266,6 +269,29 @@ async def test_plain_search_handles_punctuation_and_source_metadata(
     assert result["results"][0]["document"]["source"] == "arxiv:2411.18944"
 
 
+async def test_exact_source_search_skips_embedding(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "arxiv:2411.18944",
+                "Pose estimation content without the identifier.",
+                title="Waterfall Transformer for Multi-person Pose Estimation",
+            )
+        ]
+    )
+    embedder = service.embedder  # type: ignore[assignment]
+    embedder.embed_calls = []  # type: ignore[attr-defined]
+
+    result = await service.search(SearchInput(query="2411.18944", top_k=3))
+
+    assert result["results"][0]["document"]["source"] == "arxiv:2411.18944"
+    assert embedder.embed_calls == []  # type: ignore[attr-defined]
+
+
 async def test_search_indexes_metadata_and_tags(
     mouseion_service: tuple[SQLiteStore, MouseionService],
 ) -> None:
@@ -287,6 +313,35 @@ async def test_search_indexes_metadata_and_tags(
 
     assert author_result["results"][0]["document"]["source"] == "metadata:paper"
     assert category_result["results"][0]["document"]["source"] == "metadata:paper"
+
+
+async def test_search_result_metadata_is_compact(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    bulk_ingest = BulkIngestService(service.store, service.chunker, service.embedder)
+    await bulk_ingest.ingest(
+        [
+            _batch_item(
+                "metadata:compact",
+                "Compact metadata body uniquecompact.",
+                metadata={
+                    "authors": "Ada Lovelace",
+                    "pdf_url": "https://example.test/paper.pdf",
+                    "raw_record": "x" * 10_000,
+                },
+            )
+        ]
+    )
+
+    result = await service.search(SearchInput(query="uniquecompact", top_k=1))
+    document = result["results"][0]["document"]
+
+    assert result["results"][0]["authors"] == "Ada Lovelace"
+    assert document["metadata"] == {
+        "authors": "Ada Lovelace",
+        "pdf_url": "https://example.test/paper.pdf",
+    }
 
 
 async def test_vector_only_search_requires_confident_similarity(tmp_path: Path) -> None:
@@ -467,6 +522,26 @@ async def test_service_stats_include_documents_chunks_tags_and_types(
     assert stats["chunks"] == 2
     assert stats["tags"] == 1
     assert "edges" not in stats
+    assert stats["background_tasks"]["stats_counters"]["status"] == "complete"
+    assert stats["background_tasks"]["search_fts"]["status"] == "complete"
+
+
+async def test_search_and_stats_can_overlap(
+    mouseion_service: tuple[SQLiteStore, MouseionService],
+) -> None:
+    _, service = mouseion_service
+    for index in range(10):
+        await service.add_memory(
+            AddMemoryInput(content=f"concurrent search stats needle {index}", tags=["overlap"])
+        )
+
+    search_result, stats = await asyncio.gather(
+        service.search(SearchInput(query="concurrent needle", top_k=3)),
+        service.stats(),
+    )
+
+    assert len(search_result["results"]) >= 1
+    assert stats["documents"] == 10
 
 
 async def test_batch_ingest_batches_embeddings(

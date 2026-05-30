@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -68,17 +69,24 @@ class SQLiteStore:
         self.settings = settings
         self.vector_backend = SQLiteVectorBackend(settings)
         self.database: apsw.Connection | None = None
+        self._readonly = False
         self._write_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def open(self) -> None:
         self.settings.ensure_directories()
         await run_sync(self._open_sync)
         await self.bootstrap()
+        self.start_background_tasks()
 
     async def open_readonly(self) -> None:
         await run_sync(self._open_sync, True)
 
     def _open_sync(self, readonly: bool = False) -> None:
+        self._readonly = readonly
+        self.database = self._connect_sync(readonly=readonly)
+
+    def _connect_sync(self, *, readonly: bool) -> apsw.Connection:
         flags = (
             apsw.SQLITE_OPEN_READONLY
             if readonly
@@ -93,9 +101,15 @@ class SQLiteStore:
         conn.execute("PRAGMA busy_timeout=5000")
         if readonly:
             self.vector_backend.initialize_if_present_sync(conn)
-        self.database = conn
+        return conn
 
     async def close(self) -> None:
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*self._background_tasks)
+        self._background_tasks.clear()
         if self.database is not None:
             self.database.close()
         self.database = None
@@ -113,9 +127,15 @@ class SQLiteStore:
     def _execute_sync(
         self, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any]
     ) -> QueryResult:
-        return QueryResult(_rows_from_cursor(self.connection().cursor(), query, parameters))
+        conn = self._connect_sync(readonly=True)
+        try:
+            return QueryResult(_rows_from_cursor(conn.cursor(), query, parameters))
+        finally:
+            conn.close()
 
     async def write(self, fn: Callable[[apsw.Connection], T]) -> T:
+        if self._readonly:
+            raise RuntimeError("SQLite database was opened read-only")
         async with self._write_lock:
             return await run_sync(self._write_sync, fn)
 
@@ -136,6 +156,8 @@ class SQLiteStore:
                 conn.execute(statement)
             conn.execute("DELETE FROM meta WHERE key = ?", ("last_recompute_at",))
             self.vector_backend.ensure_bootstrap_meta_sync(conn)
+            _ensure_stats_counters_sync(conn)
+            _ensure_search_fts_backfill_status_sync(conn)
             conn.execute(
                 """
                 INSERT INTO meta(key, value) VALUES(?, ?)
@@ -144,9 +166,90 @@ class SQLiteStore:
                 ("schema_version", SCHEMA_VERSION),
             )
             self.vector_backend.initialize_sync(conn)
-            _backfill_search_fts(conn)
 
         await self.write(run)
+
+    def start_background_tasks(self) -> None:
+        if self._readonly:
+            return
+        for runner in (self._backfill_stats_counters, self._backfill_search_fts):
+            task = asyncio.create_task(runner())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def background_status(self) -> dict[str, Any]:
+        result = await self.execute(
+            """
+            SELECT key, value
+            FROM meta
+            WHERE key IN (
+              'stats_counters_status',
+              'stats_counters_initialized',
+              'stats_counters_error',
+              'search_fts_backfill_status',
+              'search_fts_backfilled_rows',
+              'search_fts_backfill_error'
+            )
+            """
+        )
+        meta = {str(row["key"]): str(row["value"]) for row in result.rows}
+        return {
+            "stats_counters": {
+                "status": meta.get("stats_counters_status", "unknown"),
+                "initialized": meta.get("stats_counters_initialized") == "true",
+                "error": meta.get("stats_counters_error"),
+            },
+            "search_fts": {
+                "status": meta.get("search_fts_backfill_status", "unknown"),
+                "backfilled_rows": int(meta.get("search_fts_backfilled_rows", "0")),
+                "error": meta.get("search_fts_backfill_error"),
+            },
+        }
+
+    async def _backfill_stats_counters(self) -> None:
+        status = await self.get_meta("stats_counters_status")
+        if status not in {"pending", "running", "error"}:
+            return
+
+        def run(conn: apsw.Connection) -> None:
+            _set_meta_sync(conn, "stats_counters_status", "running")
+            _refresh_stats_counters_sync(conn)
+            _set_meta_sync(conn, "stats_counters_initialized", "true")
+            _set_meta_sync(conn, "stats_counters_status", "complete")
+            _set_meta_sync(conn, "stats_counters_error", "")
+
+        try:
+            await self.write(run)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.set_meta("stats_counters_status", "error")
+            await self.set_meta("stats_counters_error", str(exc))
+
+    async def _backfill_search_fts(self) -> None:
+        status = await self.get_meta("search_fts_backfill_status")
+        if status not in {"pending", "running", "error"}:
+            return
+
+        try:
+            await self.set_meta("search_fts_backfill_status", "running")
+            while True:
+                inserted = await self.write(_backfill_search_fts_batch)
+                if inserted == 0:
+                    await self.set_meta("search_fts_backfill_status", "complete")
+                    await self.set_meta("search_fts_backfill_error", "")
+                    return
+                current = await self.get_meta("search_fts_backfilled_rows")
+                await self.set_meta(
+                    "search_fts_backfilled_rows",
+                    str(int(current or "0") + inserted),
+                )
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.set_meta("search_fts_backfill_status", "error")
+            await self.set_meta("search_fts_backfill_error", str(exc))
 
     def _ensure_meta_sync(self, conn: apsw.Connection, key: str, value: str) -> None:
         row = _fetch_one(conn, "SELECT value FROM meta WHERE key = ?", (key,))
@@ -175,6 +278,35 @@ class SQLiteStore:
 
     async def vector_status(self) -> dict[str, Any]:
         return await self.vector_backend.status(self.execute)
+
+    async def stats(self) -> dict[str, Any]:
+        counters = await self.execute(
+            """
+            SELECT name, value
+            FROM stats_counters
+            WHERE name IN ('documents', 'chunks', 'tags')
+            """
+        )
+        documents_by_type = await self.execute(
+            """
+            SELECT type, value
+            FROM stats_document_types
+            WHERE value > 0
+            ORDER BY type
+            """
+        )
+        values = {str(row["name"]): int(row["value"]) for row in counters.rows}
+        background = await self.background_status()
+        return {
+            "documents": values.get("documents", 0),
+            "chunks": values.get("chunks", 0),
+            "tags": values.get("tags", 0),
+            "documents_by_type": {
+                str(row["type"]): int(row["value"]) for row in documents_by_type.rows
+            },
+            "stats_ready": background["stats_counters"]["initialized"],
+            "background_tasks": background,
+        }
 
     async def vector_quantize_memory(self, qbits: int) -> int:
         return await self.vector_backend.quantize_memory(self.execute, qbits)
@@ -419,6 +551,7 @@ SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_doc_source ON documents(source)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_title_nocase ON documents(title COLLATE NOCASE)",
     "CREATE INDEX IF NOT EXISTS idx_doc_type_source ON documents(type, source)",
     "CREATE INDEX IF NOT EXISTS idx_doc_type_content_hash ON documents(type, content_hash)",
     """
@@ -497,6 +630,65 @@ SCHEMA_STATEMENTS = [
       DELETE FROM search_fts WHERE rowid = old.id;
     END
     """,
+    """
+    CREATE TABLE IF NOT EXISTS stats_counters(
+      name TEXT PRIMARY KEY,
+      value INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS stats_document_types(
+      type TEXT PRIMARY KEY,
+      value INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS documents_stats_ai AFTER INSERT ON documents BEGIN
+      INSERT INTO stats_counters(name, value) VALUES('documents', 1)
+      ON CONFLICT(name) DO UPDATE SET value = value + 1;
+      INSERT INTO stats_document_types(type, value) VALUES(new.type, 1)
+      ON CONFLICT(type) DO UPDATE SET value = value + 1;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS documents_stats_ad AFTER DELETE ON documents BEGIN
+      UPDATE stats_counters SET value = max(value - 1, 0) WHERE name = 'documents';
+      UPDATE stats_document_types SET value = max(value - 1, 0) WHERE type = old.type;
+      DELETE FROM stats_document_types WHERE value = 0;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS documents_stats_au AFTER UPDATE OF type ON documents
+    WHEN old.type != new.type
+    BEGIN
+      UPDATE stats_document_types SET value = max(value - 1, 0) WHERE type = old.type;
+      DELETE FROM stats_document_types WHERE value = 0;
+      INSERT INTO stats_document_types(type, value) VALUES(new.type, 1)
+      ON CONFLICT(type) DO UPDATE SET value = value + 1;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_stats_ai AFTER INSERT ON chunks BEGIN
+      INSERT INTO stats_counters(name, value) VALUES('chunks', 1)
+      ON CONFLICT(name) DO UPDATE SET value = value + 1;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS chunks_stats_ad AFTER DELETE ON chunks BEGIN
+      UPDATE stats_counters SET value = max(value - 1, 0) WHERE name = 'chunks';
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tags_stats_ai AFTER INSERT ON tags BEGIN
+      INSERT INTO stats_counters(name, value) VALUES('tags', 1)
+      ON CONFLICT(name) DO UPDATE SET value = value + 1;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tags_stats_ad AFTER DELETE ON tags BEGIN
+      UPDATE stats_counters SET value = max(value - 1, 0) WHERE name = 'tags';
+    END
+    """,
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
 ]
 
@@ -520,6 +712,16 @@ def _fetch_one(
 ) -> dict[str, Any] | None:
     rows = _rows_from_cursor(conn.cursor(), query, parameters)
     return rows[0] if rows else None
+
+
+def _set_meta_sync(conn: apsw.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
 
 
 def _batched[T](items: list[T], size: int) -> list[list[T]]:
@@ -570,10 +772,81 @@ def _delete_document_children(conn: apsw.Connection, document_ids: list[str]) ->
         conn.execute(f"DELETE FROM tags WHERE document_id IN ({placeholders})", document_id_batch)
 
 
-def _backfill_search_fts(conn: apsw.Connection) -> None:
+def _ensure_stats_counters_sync(conn: apsw.Connection) -> None:
+    for name in ("documents", "chunks", "tags"):
+        conn.execute(
+            "INSERT OR IGNORE INTO stats_counters(name, value) VALUES(?, 0)",
+            (name,),
+        )
+    initialized = _fetch_one(
+        conn,
+        "SELECT value FROM meta WHERE key = ?",
+        ("stats_counters_initialized",),
+    )
+    if initialized is not None and str(initialized["value"]) == "true":
+        return
+    has_rows = any(
+        _fetch_one(conn, f"SELECT 1 FROM {table} LIMIT 1") is not None
+        for table in ("documents", "chunks", "tags")
+    )
+    if has_rows:
+        _set_meta_sync(conn, "stats_counters_initialized", "false")
+        _set_meta_sync(conn, "stats_counters_status", "pending")
+    else:
+        _set_meta_sync(conn, "stats_counters_initialized", "true")
+        _set_meta_sync(conn, "stats_counters_status", "complete")
+        _set_meta_sync(conn, "stats_counters_error", "")
+
+
+def _refresh_stats_counters_sync(conn: apsw.Connection) -> None:
+    conn.execute("DELETE FROM stats_counters")
+    conn.executemany(
+        "INSERT INTO stats_counters(name, value) VALUES(?, ?)",
+        [
+            ("documents", _count_table_sync(conn, "documents")),
+            ("chunks", _count_table_sync(conn, "chunks")),
+            ("tags", _count_table_sync(conn, "tags")),
+        ],
+    )
+    conn.execute("DELETE FROM stats_document_types")
     conn.execute(
         """
-        INSERT INTO search_fts(rowid, title, source, tags, metadata, content)
+        INSERT INTO stats_document_types(type, value)
+        SELECT type, count(*)
+        FROM documents
+        GROUP BY type
+        """
+    )
+
+
+def _count_table_sync(conn: apsw.Connection, table: str) -> int:
+    row = _fetch_one(conn, f"SELECT count(*) AS total FROM {table}")
+    return int(row["total"] if row else 0)
+
+
+def _ensure_search_fts_backfill_status_sync(conn: apsw.Connection) -> None:
+    row = _fetch_one(
+        conn,
+        "SELECT value FROM meta WHERE key = ?",
+        ("search_fts_backfill_status",),
+    )
+    if row is not None and str(row["value"]) == "running":
+        _set_meta_sync(conn, "search_fts_backfill_status", "pending")
+        return
+    if row is not None:
+        return
+    if _fetch_one(conn, "SELECT 1 FROM chunks LIMIT 1") is None:
+        _set_meta_sync(conn, "search_fts_backfill_status", "complete")
+    else:
+        _set_meta_sync(conn, "search_fts_backfill_status", "pending")
+    _set_meta_sync(conn, "search_fts_backfilled_rows", "0")
+    _set_meta_sync(conn, "search_fts_backfill_error", "")
+
+
+def _backfill_search_fts_batch(conn: apsw.Connection, batch_size: int = 1000) -> int:
+    rows = _rows_from_cursor(
+        conn.cursor(),
+        """
         SELECT c.id,
                d.title,
                d.source,
@@ -591,8 +864,31 @@ def _backfill_search_fts(conn: apsw.Connection) -> None:
         JOIN documents d ON d.id = c.document_id
         LEFT JOIN search_fts f ON f.rowid = c.id
         WHERE f.rowid IS NULL
-        """
+        ORDER BY c.id
+        LIMIT ?
+        """,
+        (batch_size,),
     )
+    if not rows:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO search_fts(rowid, title, source, tags, metadata, content)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                int(row["id"]),
+                str(row["title"]),
+                str(row["source"]),
+                str(row["tags"]),
+                _metadata_search_text(json_loads(row["metadata"])),
+                str(row["content"]),
+            )
+            for row in rows
+        ],
+    )
+    return len(rows)
 
 
 def _upsert_document_row(

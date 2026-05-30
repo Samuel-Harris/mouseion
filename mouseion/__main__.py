@@ -220,6 +220,13 @@ def _print_status(status: JsonDict) -> None:
         print(f"  {doc_type}: {total}")
     print(f"Chunks: {stats['chunks']}")
     print(f"Tags: {stats['tags']}")
+    background_tasks = stats.get("background_tasks")
+    if isinstance(background_tasks, Mapping):
+        print("Background tasks:")
+        for name, details in cast(ObjectMapping, background_tasks).items():
+            if isinstance(details, Mapping):
+                status_value = cast(ObjectMapping, details).get("status", "unknown")
+                print(f"  {name}: {status_value}")
 
 
 def _mouseion_base_url(settings: Settings) -> str:
@@ -267,17 +274,40 @@ def _local_database_stats(settings: Settings) -> JsonDict:
 
 def _stats_from_connection(conn: apsw.Connection) -> JsonDict:
     document_types: dict[str, int] = {}
-    if _table_exists(conn, "documents"):
+    if _table_exists(conn, "stats_document_types"):
+        for doc_type, total in conn.execute(
+            "SELECT type, value FROM stats_document_types WHERE value > 0 ORDER BY type"
+        ):
+            document_types[str(doc_type)] = int(total)
+    elif _table_exists(conn, "documents"):
         for doc_type, total in conn.execute(
             "SELECT type, count(*) FROM documents GROUP BY type ORDER BY type"
         ):
             document_types[str(doc_type)] = int(total)
+
+    counters = _stats_counters(conn)
+    if counters is not None:
+        return {
+            "documents": counters.get("documents", 0),
+            "chunks": counters.get("chunks", 0),
+            "tags": counters.get("tags", 0),
+            "documents_by_type": document_types,
+        }
 
     return {
         "documents": _count_table(conn, "documents"),
         "chunks": _count_table(conn, "chunks"),
         "tags": _count_table(conn, "tags"),
         "documents_by_type": document_types,
+    }
+
+
+def _stats_counters(conn: apsw.Connection) -> dict[str, int] | None:
+    if not _table_exists(conn, "stats_counters"):
+        return None
+    return {
+        str(name): int(value)
+        for name, value in conn.execute("SELECT name, value FROM stats_counters")
     }
 
 
@@ -305,6 +335,7 @@ def _empty_stats() -> JsonDict:
         "chunks": 0,
         "tags": 0,
         "documents_by_type": {},
+        "background_tasks": {},
     }
 
 
@@ -320,6 +351,9 @@ def _normalize_stats(stats: ObjectMapping) -> JsonDict:
         normalized["documents_by_type"] = {
             str(doc_type): _int_value(total, 0) for doc_type, total in document_type_values.items()
         }
+    background_tasks = stats.get("background_tasks")
+    if isinstance(background_tasks, Mapping):
+        normalized["background_tasks"] = dict(cast(ObjectMapping, background_tasks))
     return normalized
 
 
