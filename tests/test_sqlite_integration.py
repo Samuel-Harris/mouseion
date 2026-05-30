@@ -6,7 +6,6 @@ from uuid import UUID
 
 import apsw
 import pytest
-import sqlite_vec
 
 from mouseion.config import Settings
 from mouseion.domain.models import (
@@ -126,43 +125,6 @@ async def test_fresh_database_uses_sqlite_vector_blob_table(tmp_path: Path) -> N
         )
 
         assert hits.rows == [{"rowid": 1, "distance": 0.0}]
-    finally:
-        await store.close()
-
-
-async def test_vec0_chunk_vectors_auto_migrate_to_blob_table(tmp_path: Path) -> None:
-    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
-    settings.ensure_directories()
-    _create_legacy_vec0_database(settings.sqlite_path)
-
-    store = SQLiteStore(settings)
-    await store.open()
-    try:
-        counts = {
-            "documents": await store.execute("SELECT count(*) AS total FROM documents"),
-            "tags": await store.execute("SELECT count(*) AS total FROM tags"),
-            "related": await store.execute("SELECT count(*) AS total FROM related_to"),
-            "similar": await store.execute("SELECT count(*) AS total FROM similar_to"),
-            "vectors": await store.execute("SELECT count(*) AS total FROM chunk_vectors"),
-        }
-        schema = await store.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunk_vectors'"
-        )
-        hits = await store.execute(
-            """
-            SELECT rowid, distance
-            FROM vector_full_scan('chunk_vectors', 'embedding', ?, 1)
-            """,
-            (embedding_blob([0.0] * 767 + [1.0]),),
-        )
-
-        assert int(counts["documents"].first()["total"]) == 1  # type: ignore[index]
-        assert int(counts["tags"].first()["total"]) == 1  # type: ignore[index]
-        assert int(counts["related"].first()["total"]) == 1  # type: ignore[index]
-        assert int(counts["similar"].first()["total"]) == 1  # type: ignore[index]
-        assert int(counts["vectors"].first()["total"]) == 1  # type: ignore[index]
-        assert "USING vec0" not in str(schema.first()["sql"])  # type: ignore[index]
-        assert hits.rows[0]["rowid"] == 1
     finally:
         await store.close()
 
@@ -544,110 +506,3 @@ def _batch_item(source: str, content: str, tags: list[str] | None = None) -> Bat
         chunks=[ChunkText(content=content, token_count=len(content.split()))],
     )
 
-
-def _create_legacy_vec0_database(path: Path) -> None:
-    conn = apsw.Connection(str(path))
-    conn.enableloadextension(True)
-    sqlite_vec.load(conn)
-    conn.enableloadextension(False)
-    try:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute(
-            """
-            CREATE TABLE documents(
-              id TEXT PRIMARY KEY,
-              type TEXT,
-              title TEXT,
-              source TEXT,
-              content_hash TEXT,
-              created_at TEXT,
-              updated_at TEXT,
-              metadata TEXT DEFAULT '{}'
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE chunks(
-              id INTEGER PRIMARY KEY,
-              document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-              content TEXT,
-              chunk_index INTEGER,
-              token_count INTEGER,
-              created_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE tags(
-              document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-              tag TEXT,
-              PRIMARY KEY(document_id, tag)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE similar_to(
-              from_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-              to_chunk INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
-              score REAL,
-              CHECK(from_chunk < to_chunk),
-              PRIMARY KEY(from_chunk, to_chunk)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE related_to(
-              from_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-              to_doc TEXT REFERENCES documents(id) ON DELETE CASCADE,
-              label TEXT DEFAULT '',
-              note TEXT,
-              created_at TEXT,
-              PRIMARY KEY(from_doc, to_doc, label)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE chunk_vectors USING vec0(
-              chunk_id INTEGER PRIMARY KEY,
-              embedding FLOAT[768] distance_metric=cosine
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO documents(id, type, title, source, content_hash, created_at, updated_at)
-            VALUES('doc', 'memory', 'Legacy', 'memory:legacy', 'hash', '2026-01-01', '2026-01-01')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO chunks(id, document_id, content, chunk_index, token_count, created_at)
-            VALUES(1, 'doc', 'legacy vector', 0, 2, '2026-01-01')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO chunks(id, document_id, content, chunk_index, token_count, created_at)
-            VALUES(2, 'doc', 'legacy related', 1, 2, '2026-01-01')
-            """
-        )
-        conn.execute("INSERT INTO tags(document_id, tag) VALUES('doc', 'legacy')")
-        conn.execute("INSERT INTO similar_to(from_chunk, to_chunk, score) VALUES(1, 2, 0.9)")
-        conn.execute(
-            """
-            INSERT INTO related_to(from_doc, to_doc, label, note, created_at)
-            VALUES('doc', 'doc', 'self', '', '2026-01-01')
-            """
-        )
-        conn.execute(
-            "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
-            (1, embedding_blob([0.0] * 767 + [1.0])),
-        )
-    finally:
-        conn.close()

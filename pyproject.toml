@@ -19,7 +19,6 @@ dependencies = [
     "python-multipart>=0.0.20",
     "rich>=14.0.0",
     "sqliteai-vector>=1.0.0",
-    "sqlite-vec>=0.1.9",
     "structlog>=25.1.0",
     "tiktoken>=0.9.0",
     "trafilatura>=2.0.0",

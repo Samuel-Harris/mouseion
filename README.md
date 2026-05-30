@@ -65,7 +65,7 @@ uv run mouseion vector quantize --qbits 4 --preload
 uv run mouseion vector cleanup
 ```
 
-Exact full-scan vector search is the default. TurboQuant search is opt-in with `qbits` set to `2`, `3`, or `4`; `sqlite-vec` remains installed only so legacy `vec0` databases can be migrated automatically on open.
+Exact full-scan vector search is the default. TurboQuant search is opt-in with `qbits` set to `2`, `3`, or `4`.
 
 ## Configuration
 

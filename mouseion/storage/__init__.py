@@ -1,1 +1,1 @@
-"""Storage adapters and migrations."""
+"""Storage adapters."""

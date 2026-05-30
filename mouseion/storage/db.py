@@ -111,11 +111,7 @@ class SQLiteStore:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA recursive_triggers=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        if (
-            readonly
-            and _table_exists_sync(conn, VECTOR_TABLE)
-            and not _is_vec0_chunk_vectors_sync(conn)
-        ):
+        if readonly and _table_exists_sync(conn, VECTOR_TABLE):
             _initialize_vector_sync(conn)
         self.database = conn
 
@@ -156,7 +152,6 @@ class SQLiteStore:
 
     async def bootstrap(self) -> None:
         def run(conn: apsw.Connection) -> None:
-            _migrate_vec0_chunk_vectors_sync(conn)
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
             self._ensure_meta_sync(conn, "schema_version", SCHEMA_VERSION)
@@ -664,61 +659,11 @@ def _load_sqlite_vector(conn: apsw.Connection) -> None:
         conn.enableloadextension(False)
 
 
-def _load_sqlite_vec_for_migration(conn: apsw.Connection) -> None:
-    import sqlite_vec
-
-    conn.enableloadextension(True)
-    try:
-        sqlite_vec.load(conn)
-    finally:
-        conn.enableloadextension(False)
-
-
 def _initialize_vector_sync(conn: apsw.Connection) -> None:
     conn.execute(
         "SELECT vector_init(?, ?, ?)",
         (VECTOR_TABLE, VECTOR_COLUMN, VECTOR_INIT_OPTIONS),
     )
-
-
-def _migrate_vec0_chunk_vectors_sync(conn: apsw.Connection) -> None:
-    if not _is_vec0_chunk_vectors_sync(conn):
-        return
-    _load_sqlite_vec_for_migration(conn)
-    conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chunk_vectors_new(
-          chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
-          embedding BLOB NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO chunk_vectors_new(chunk_id, embedding)
-        SELECT chunk_id, embedding
-        FROM chunk_vectors
-        """
-    )
-    conn.execute("DROP TABLE chunk_vectors")
-    conn.execute("ALTER TABLE chunk_vectors_new RENAME TO chunk_vectors")
-
-
-def _is_vec0_chunk_vectors_sync(conn: apsw.Connection) -> bool:
-    row = _fetch_one(
-        conn,
-        """
-        SELECT sql
-        FROM sqlite_master
-        WHERE name = ? AND type = 'table'
-        LIMIT 1
-        """,
-        (VECTOR_TABLE,),
-    )
-    if row is None:
-        return False
-    return "USING VEC0" in str(row.get("sql", "")).upper()
 
 
 def _table_exists_sync(conn: apsw.Connection, table: str) -> bool:
