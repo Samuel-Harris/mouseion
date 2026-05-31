@@ -35,9 +35,7 @@ class Settings(BaseSettings):
     vector_quantization_qbits: Literal[2, 3, 4] = Field(
         default=4, alias="MOUSEION_VECTOR_QUANTIZATION_QBITS"
     )
-    vector_quantize_preload: bool = Field(
-        default=False, alias="MOUSEION_VECTOR_QUANTIZE_PRELOAD"
-    )
+    vector_quantize_preload: bool = Field(default=False, alias="MOUSEION_VECTOR_QUANTIZE_PRELOAD")
     vector_quantize_max_memory: str = Field(
         default="30MB", alias="MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY"
     )
@@ -57,6 +55,18 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_vector_search_mode(cls, value: object) -> object:
         return value.lower() if isinstance(value, str) else value
+
+    @field_validator("vector_quantization_qbits", mode="before")
+    @classmethod
+    def coerce_vector_quantization_qbits(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("MOUSEION_VECTOR_QUANTIZATION_QBITS must not be empty")
+            value = int(stripped)
+        if value not in {2, 3, 4}:
+            raise ValueError("MOUSEION_VECTOR_QUANTIZATION_QBITS must be 2, 3, or 4")
+        return value
 
     @field_validator("vector_quantize_max_memory", mode="before")
     @classmethod
