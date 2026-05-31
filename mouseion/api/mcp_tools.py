@@ -112,8 +112,4 @@ def build_mcp(
     async def mouseion_delete(id: str) -> dict[str, Any]:
         return await service().delete(DeleteInput(id=UUID(id)))
 
-    @mcp.tool()
-    async def mouseion_export() -> dict[str, Any]:
-        return await service().export()
-
     return mcp

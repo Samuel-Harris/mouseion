@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,25 @@ def test_build_mcp_uses_custom_description() -> None:
     mcp = build_mcp({}, description="Custom corpus description")
 
     assert mcp.instructions == "Custom corpus description"
+
+
+def test_mcp_tool_registry_excludes_export() -> None:
+    tools = asyncio.run(build_mcp({}).list_tools())
+    tool_names = {tool.name for tool in tools}
+
+    assert "mouseion_export" not in tool_names
+    assert {
+        "mouseion_add_url",
+        "mouseion_add_file",
+        "mouseion_add_memory",
+        "mouseion_add_repo",
+        "mouseion_search",
+        "mouseion_read_document",
+        "mouseion_document_outline",
+        "mouseion_search_document",
+        "mouseion_list",
+        "mouseion_delete",
+    } <= tool_names
 
 
 def test_mcp_route_is_exposed_without_double_prefix() -> None:

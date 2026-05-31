@@ -84,7 +84,7 @@ Settings are loaded from `.env` and environment variables:
 | `MOUSEION_VECTOR_QUANTIZE_MAX_MEMORY` | `30MB`            |
 | `LOG_LEVEL`                    | `INFO`                   |
 
-`data/` and cloned repos under `repos/` are intentionally gitignored. `data/mouseion.db` is the source of truth for mouseion content; include `mouseion.db`, `mouseion.db-wal`, and `mouseion.db-shm` when making a file-level backup. Use `mouseion_export` for a markdown dump.
+`data/` and cloned repos under `repos/` are intentionally gitignored. `data/mouseion.db` is the source of truth for mouseion content; include `mouseion.db`, `mouseion.db-wal`, and `mouseion.db-shm` when making a file-level backup. Use `POST /api/export` for a markdown dump.
 
 ## MCP Tools
 
@@ -98,7 +98,6 @@ Settings are loaded from `.env` and environment variables:
 - `mouseion_search_document`
 - `mouseion_list`
 - `mouseion_delete`
-- `mouseion_export`
 
 All tools return JSON. `mouseion_read_document` returns metadata, paged clean text, an
 opaque `next_cursor`, and pagination totals without returning embeddings. The daemon does
