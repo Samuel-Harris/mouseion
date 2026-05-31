@@ -81,3 +81,13 @@ def test_vector_settings_reject_invalid_qbits(tmp_path: Path) -> None:
             MOUSEION_REPOS_DIR=tmp_path / "repos",
             MOUSEION_VECTOR_QUANTIZATION_QBITS=8,
         )
+
+
+def test_vector_settings_coerce_qbits_from_env_string(tmp_path: Path) -> None:
+    settings = Settings(
+        MOUSEION_DATA_DIR=tmp_path / "data",
+        MOUSEION_REPOS_DIR=tmp_path / "repos",
+        MOUSEION_VECTOR_QUANTIZATION_QBITS="4",
+    )
+
+    assert settings.vector_quantization_qbits == 4
