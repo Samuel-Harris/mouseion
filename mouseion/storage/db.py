@@ -525,21 +525,57 @@ class SQLiteStore:
 
     async def delete_document(self, document_id: UUID) -> int:
         def run(conn: apsw.Connection) -> int:
-            chunk_ids = [
-                int(row["id"])
-                for row in _rows_from_cursor(
-                    conn.cursor(),
-                    "SELECT id FROM chunks WHERE document_id = ?",
-                    (str(document_id),),
-                )
-            ]
-            conn.execute("DELETE FROM documents WHERE id = ?", (str(document_id),))
-            if chunk_ids:
-                self.vector_backend.mark_dirty_sync(conn)
-            return len(chunk_ids)
+            _, deleted_chunks = self._delete_documents_sync(conn, [str(document_id)])
+            return deleted_chunks
 
-        deleted = await self.write(run)
-        return int(deleted)
+        deleted_chunks = await self.write(run)
+        return int(deleted_chunks)
+
+    async def delete_documents_by_source(self, sources: list[str]) -> int:
+        if not sources:
+            return 0
+
+        def run(conn: apsw.Connection) -> int:
+            deleted_documents = 0
+            for source_batch in _batched(sources, 900):
+                placeholders = ",".join("?" for _ in source_batch)
+                document_ids = [
+                    str(row["id"])
+                    for row in _rows_from_cursor(
+                        conn.cursor(),
+                        f"SELECT id FROM documents WHERE source IN ({placeholders})",
+                        tuple(source_batch),
+                    )
+                ]
+                deleted, _ = self._delete_documents_sync(conn, document_ids)
+                deleted_documents += deleted
+            return deleted_documents
+
+        deleted_documents = await self.write(run)
+        return int(deleted_documents)
+
+    def _delete_documents_sync(
+        self, conn: apsw.Connection, document_ids: list[str]
+    ) -> tuple[int, int]:
+        deleted_documents = 0
+        deleted_chunks = 0
+        for document_batch in _batched(document_ids, 900):
+            placeholders = ",".join("?" for _ in document_batch)
+            chunk_ids = _rows_from_cursor(
+                conn.cursor(),
+                f"SELECT id FROM chunks WHERE document_id IN ({placeholders})",
+                tuple(document_batch),
+            )
+            conn.execute(
+                f"DELETE FROM documents WHERE id IN ({placeholders})",
+                tuple(document_batch),
+            )
+            deleted_documents += len(document_batch)
+            deleted_chunks += len(chunk_ids)
+        if deleted_chunks:
+            self.vector_backend.mark_dirty_sync(conn)
+        return deleted_documents, deleted_chunks
+
 
 def _rows_from_cursor(
     cursor: apsw.Cursor, query: str, parameters: dict[str, Any] | tuple[Any, ...] | list[Any] = ()
