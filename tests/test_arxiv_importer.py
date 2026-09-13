@@ -4,10 +4,13 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import httpx
 import pytest
+from arxiv_oai_fixtures import list_records_page, list_sets_page, record
 
+import utilities.arxiv.oai as oai_module
 from mouseion.config import Settings
-from mouseion.domain.models import ReadDocumentInput, SearchInput
+from mouseion.domain.models import DocumentType, ReadDocumentInput, SearchInput
 from mouseion.errors import EmbeddingError
 from mouseion.ingest.chunker import Chunker
 from mouseion.ingest.ingestor import Ingestor
@@ -16,15 +19,16 @@ from mouseion.services.document_reader import DocumentReader
 from mouseion.services.exporter import Exporter
 from mouseion.services.search import SearchService
 from mouseion.services.service import MouseionService
-from mouseion.storage.db import SQLiteStore
+from mouseion.storage.db import DocumentChunkUpsert, SQLiteStore
 from utilities.arxiv.import_arxiv_metadata import (
     ImportOptions,
+    UnknownFilterError,
     async_main,
     category_filter_codes,
     import_arxiv_metadata,
-    load_category_catalog,
     raw_categories_match_filter,
 )
+from utilities.arxiv.taxonomy import load_category_catalog
 
 
 class FakeEmbedder:
@@ -556,3 +560,250 @@ async def test_unknown_categories_are_imported_and_reported(
     assert document["source"] == "arxiv:1234.0002"
     assert "arxiv:category:unknown.xy" in document["tags"]
     assert document["metadata"]["unresolved_categories"] == ["unknown.XY"]
+
+
+OAI_SETS = [("cs", "Computer Science")]
+
+
+class FakeOaiClient:
+    def __init__(
+        self,
+        *,
+        sets: list[tuple[str, str]],
+        records: list[dict[str, object]],
+        fail_records: bool = False,
+    ) -> None:
+        self._sets_xml = list_sets_page(sets)
+        self._records_xml = list_records_page(records)
+        self._fail_records = fail_records
+        self.record_requests = 0
+
+    async def __aenter__(self) -> FakeOaiClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def get(self, url: str, params: dict[str, str] | None = None) -> httpx.Response:
+        request = httpx.Request("GET", url)
+        if (params or {}).get("verb") == "ListSets":
+            return httpx.Response(200, content=self._sets_xml, request=request)
+        if self._fail_records:
+            raise httpx.ConnectError("network down", request=request)
+        self.record_requests += 1
+        return httpx.Response(200, content=self._records_xml, request=request)
+
+
+def install_oai_client(monkeypatch: pytest.MonkeyPatch, client: FakeOaiClient) -> None:
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    async def no_retry_sleep(response: httpx.Response | None, attempt: int) -> None:
+        return None
+
+    monkeypatch.setattr(oai_module, "_sleep", no_sleep)
+    monkeypatch.setattr(oai_module, "_sleep_before_retry", no_retry_sleep)
+
+
+async def seed_arxiv_document(settings: Settings, *, source: str, update_date: str) -> None:
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        await store.upsert_documents_with_chunks(
+            [
+                DocumentChunkUpsert(
+                    document_id=None,
+                    doc_type=DocumentType.DOCUMENT,
+                    title="Seeded paper",
+                    source=source,
+                    content_hash="seeded-content-hash",
+                    tags=["arxiv", "arxiv:group:computer-science"],
+                    metadata={"update_date": update_date},
+                    chunks=[("seeded content", 2, [0.0] * 767 + [1.0])],
+                )
+            ]
+        )
+    finally:
+        await store.close()
+
+
+async def read_meta(settings: Settings, key: str) -> str | None:
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        return await store.get_meta(key)
+    finally:
+        await store.close()
+
+
+async def count_rows(settings: Settings, sql: str) -> int:
+    store = SQLiteStore(settings)
+    await store.open()
+    try:
+        row = (await store.execute(sql)).first()
+        return int(row["total"]) if row else 0
+    finally:
+        await store.close()
+
+
+async def test_oai_harvest_persists_cursor_seeded_from_existing_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    await seed_arxiv_document(settings, source="arxiv:9999.0001", update_date="2026-05-01")
+    install_oai_client(monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[]))
+
+    stats = await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+
+    assert stats.selected == 0
+    assert await read_meta(settings, "arxiv_harvest_cursor") == "2026-05-01"
+    assert await read_meta(settings, "arxiv_harvest_status") == "complete"
+
+
+async def test_oai_harvest_advances_cursor_to_latest_datestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    install_oai_client(
+        monkeypatch,
+        FakeOaiClient(
+            sets=OAI_SETS,
+            records=[
+                record("1111.0001", datestamp="2026-09-01"),
+                record("1111.0002", datestamp="2026-09-03"),
+            ],
+        ),
+    )
+
+    stats = await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+
+    assert stats.inserted == 2
+    assert await read_meta(settings, "arxiv_harvest_cursor") == "2026-09-03"
+
+
+async def test_oai_harvest_failure_leaves_cursor_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    install_oai_client(
+        monkeypatch,
+        FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001", datestamp="2026-09-03")]),
+    )
+    await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+    before = await read_meta(settings, "arxiv_harvest_cursor")
+
+    install_oai_client(monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[], fail_records=True))
+    with pytest.raises(httpx.ConnectError):
+        await import_arxiv_metadata(
+            ImportOptions(progress_every=0),
+            settings=settings,
+            embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        )
+
+    assert before == "2026-09-03"
+    assert await read_meta(settings, "arxiv_harvest_cursor") == before
+    assert await read_meta(settings, "arxiv_harvest_status") == "error"
+
+
+async def test_oai_deleted_record_removes_document_and_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    install_oai_client(monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001")]))
+    await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+    assert await count_rows(settings, "SELECT count(*) AS total FROM documents") == 1
+
+    install_oai_client(
+        monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001", deleted=True)])
+    )
+    stats = await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+
+    assert stats.deleted == 1
+    assert await count_rows(settings, "SELECT count(*) AS total FROM documents") == 0
+    assert await count_rows(settings, "SELECT count(*) AS total FROM chunks") == 0
+
+
+async def test_oai_harvest_is_idempotent_and_skips_embeddings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    install_oai_client(
+        monkeypatch,
+        FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001"), record("1111.0002")]),
+    )
+
+    first = await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=FakeEmbedder(),  # type: ignore[arg-type]
+    )
+    rerun_embedder = RecordingEmbedder()
+    second = await import_arxiv_metadata(
+        ImportOptions(progress_every=0),
+        settings=settings,
+        embedder=rerun_embedder,  # type: ignore[arg-type]
+    )
+
+    assert first.inserted == 2
+    assert second.inserted == 0
+    assert second.updated == 0
+    assert second.skipped == 2
+    assert rerun_embedder.calls == []
+
+
+async def test_oai_unknown_category_filter_is_rejected_without_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    await seed_arxiv_document(settings, source="arxiv:9999.0001", update_date="2026-05-01")
+    install_oai_client(
+        monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001")])
+    )
+
+    with pytest.raises(UnknownFilterError, match="typo"):
+        await import_arxiv_metadata(
+            ImportOptions(categories=("typo",), progress_every=0),
+            settings=settings,
+            embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        )
+
+    assert await count_rows(settings, "SELECT count(*) AS total FROM documents") == 1
+
+
+async def test_oai_unknown_group_filter_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(MOUSEION_DATA_DIR=tmp_path / "data", MOUSEION_REPOS_DIR=tmp_path / "repos")
+    install_oai_client(
+        monkeypatch, FakeOaiClient(sets=OAI_SETS, records=[record("1111.0001")])
+    )
+
+    with pytest.raises(UnknownFilterError, match="nonexistent"):
+        await import_arxiv_metadata(
+            ImportOptions(groups=("nonexistent",), progress_every=0),
+            settings=settings,
+            embedder=FakeEmbedder(),  # type: ignore[arg-type]
+        )
+
